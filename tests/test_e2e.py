@@ -381,17 +381,12 @@ def test_session_search_refresh() -> None:
     assert "main.py" in result.output
 
 
-def test_session_index_auto_init(e2e_project: Path) -> None:
-    """Running ``ccc index`` from uninitialized dir auto-inits, then search works."""
-    # Do NOT call init — just run index directly
-    result = runner.invoke(app, ["index"], catch_exceptions=False)
-    assert result.exit_code == 0, result.output
-    assert (e2e_project / ".cocoindex_code" / "settings.yml").exists()
-
-    # Search should work
-    result = runner.invoke(app, ["search", "fibonacci"], catch_exceptions=False)
-    assert result.exit_code == 0
-    assert "main.py" in result.output
+@pytest.mark.usefixtures("e2e_project")
+def test_session_index_not_initialized_errors() -> None:
+    """Running ``ccc index`` from uninitialized dir should error."""
+    result = runner.invoke(app, ["index"])
+    assert result.exit_code != 0
+    assert "ccc init" in result.output
 
 
 def test_session_subdirectory_path_default(e2e_project: Path) -> None:
