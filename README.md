@@ -169,6 +169,7 @@ The background daemon starts automatically on first use.
 | `ccc search <query>` | Semantic search across the codebase |
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
+| `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
 | `ccc reset` | Delete index databases. `--all` also removes settings. `-f` skips confirmation. |
 | `ccc daemon status` | Show daemon version, uptime, and loaded projects |
 | `ccc daemon restart` | Restart the background daemon |
@@ -185,6 +186,105 @@ ccc search --refresh database schema                 # update index first, then 
 ```
 
 By default, `ccc search` scopes results to your current working directory (relative to the project root). Use `--path` to override.
+
+## Docker
+
+A Docker image is available for teams who want a reproducible, dependency-free
+setup — no Python, `uv`, or system dependencies required on the host.
+
+The recommended approach is a **persistent container**: start it once, and use
+`docker exec` to run CLI commands or connect MCP sessions to it. The daemon
+inside stays warm across sessions, so the embedding model is loaded only once.
+
+### Step 1 — Start the container
+
+```bash
+docker run -d --name cocoindex-code \
+  --volume "$(pwd):/workspace" \
+  --volume cocoindex-db:/db \
+  --volume cocoindex-model-cache:/root/.cache \
+  ghcr.io/cocoindex-io/cocoindex-code:latest
+```
+
+- `/workspace` — mount your project root here
+- `cocoindex-db` — index databases live inside the container (fast native I/O, no cross-OS volume issues)
+- `cocoindex-model-cache` — persists the embedding model across image upgrades
+
+### Step 2 — Index your codebase
+
+```bash
+docker exec -it cocoindex-code ccc index
+```
+
+### Step 3 — Connect your coding agent
+
+<details>
+<summary>Claude Code</summary>
+
+```bash
+claude mcp add cocoindex-code -- docker exec -i cocoindex-code ccc mcp
+```
+
+Or via `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cocoindex-code": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["exec", "-i", "cocoindex-code", "ccc", "mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary>Codex</summary>
+
+```bash
+codex mcp add cocoindex-code -- docker exec -i cocoindex-code ccc mcp
+```
+</details>
+
+### CLI usage inside the container
+
+All `ccc` commands work via `docker exec`:
+
+```bash
+docker exec -it cocoindex-code ccc index
+docker exec -it cocoindex-code ccc search "authentication logic"
+docker exec -it cocoindex-code ccc status
+```
+
+Or set an alias on your host so it feels native:
+
+```bash
+alias ccc='docker exec -it cocoindex-code ccc'
+```
+
+### Configuration via environment variables
+
+Pass configuration to `docker run` with `-e`:
+
+```bash
+# Extra extensions (e.g. Typesafe Config, SBT build files)
+-e COCOINDEX_CODE_EXTRA_EXTENSIONS="conf,sbt"
+
+# Exclude build artefacts (Scala/SBT example)
+-e COCOINDEX_CODE_EXCLUDE_PATTERNS='["**/target/**","**/.bloop/**","**/.metals/**"]'
+
+# Swap in a code-optimised embedding model
+-e COCOINDEX_CODE_EMBEDDING_MODEL=voyage/voyage-code-3
+-e VOYAGE_API_KEY=your-key
+```
+
+### Build the image locally
+
+```bash
+docker build -t cocoindex-code:local -f docker/Dockerfile .
+```
 
 ## Features
 - **Semantic Code Search**: Find relevant code using natural language queries when grep doesn't work well, and save tokens immediately.
@@ -236,9 +336,42 @@ exclude_patterns:
 language_overrides:
   - ext: inc               # treat .inc files as PHP
     lang: php
+
+chunkers:
+  - ext: toml              # use a custom chunker for .toml files
+    module: example_toml_chunker:toml_chunker
 ```
 
 > `.cocoindex_code/` is automatically added to `.gitignore` during init.
+
+Use `chunkers` when you want to control how a file type is split into chunks before indexing.
+
+`module: example_toml_chunker:toml_chunker` means:
+- `example_toml_chunker` is a local Python module
+- `toml_chunker` is the function inside that module
+
+In practice, this usually means:
+- you create a Python file in your project, for example `example_toml_chunker.py`
+- you add a function in that file
+- you point `settings.yml` at it with `module.path:function_name`
+
+The function should use this signature:
+
+```python
+from pathlib import Path
+from cocoindex_code.chunking import Chunk
+
+def my_chunker(path: Path, content: str) -> tuple[str | None, list[Chunk]]:
+    ...
+```
+
+- `path` is the file being indexed
+- `content` is the full text of that file
+- return `language_override` as a string like `"toml"` if you want to override language detection
+- return `None` as `language_override` if you want to keep the detected language
+- return a `list[Chunk]` with the chunks you want stored in the index
+
+See [`src/cocoindex_code/chunking.py`](./src/cocoindex_code/chunking.py) for the public types and [`tests/example_toml_chunker.py`](./tests/example_toml_chunker.py) for a complete example.
 
 ## Embedding Models
 
@@ -417,7 +550,29 @@ embedding:
 | xml | | `.xml` |
 | yaml | | `.yaml`, `.yml` |
 
+### Custom Database Location
+
+By default, index databases (`cocoindex.db` and `target_sqlite.db`) live alongside settings in `<project>/.cocoindex_code/`. When running in Docker, you may want the databases on the container's native filesystem for performance (LMDB doesn't work well on mounted volumes) while keeping the source code and settings on a mounted volume.
+
+Set `COCOINDEX_CODE_DB_PATH_MAPPING` to remap database locations by path prefix:
+
+```bash
+COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/db-files
+```
+
+With this mapping, a project at `/workspace/myrepo` stores its databases in `/db-files/myrepo/` instead of `/workspace/myrepo/.cocoindex_code/`. Settings files remain in the original location.
+
+Multiple mappings are comma-separated and resolved in order (first match wins):
+
+```bash
+COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/db-files,/workspace2=/db-files2
+```
+
+Both source and target must be absolute paths. If no mapping matches, the default location is used.
+
 ## Troubleshooting
+
+Run `ccc doctor` to diagnose common issues. It checks your settings, daemon health, embedding model, file matching, and index status — all in one command.
 
 ### `sqlite3.Connection object has no attribute enable_load_extension`
 
@@ -458,6 +613,19 @@ If you previously configured `cocoindex-code` via environment variables, the `co
 [CocoIndex](https://github.com/cocoindex-io/cocoindex) is an ultra efficient indexing engine that also works on large codebases at scale for enterprises. In enterprise scenarios it is a lot more efficient to share indexes with teammates when there are large or many repos. We also have advanced features like branch dedupe etc designed for enterprise users.
 
 If you need help with remote setup, please email our maintainer linghua@cocoindex.io, happy to help!
+
+## Contributing
+
+We welcome contributions! Before you start, please install the [pre-commit](https://pre-commit.com/) hooks so that linting, formatting, type checking, and tests run automatically before each commit:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+This catches common issues — trailing whitespace, lint errors (Ruff), type errors (mypy), and test failures — before they reach CI.
+
+For more details, see our [contributing guide](https://cocoindex.io/docs/contributing/guide).
 
 ## License
 

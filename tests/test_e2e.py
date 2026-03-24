@@ -19,7 +19,12 @@ from typer.testing import CliRunner
 
 from cocoindex_code.cli import app
 from cocoindex_code.client import stop_daemon
-from cocoindex_code.settings import find_parent_with_marker
+from cocoindex_code.settings import (
+    _reset_db_path_mapping_cache,
+    default_project_settings,
+    find_parent_with_marker,
+    save_project_settings,
+)
 
 runner = CliRunner()
 
@@ -429,6 +434,232 @@ def test_session_not_initialized_errors(e2e_project: Path) -> None:
 
     # Return to project dir so fixture cleanup works
     os.chdir(e2e_project)
+
+
+def test_session_doctor_happy_path(e2e_project: Path) -> None:
+    """Init → index → doctor shows global settings, daemon, model, project, and index info."""
+    runner.invoke(app, ["init"], catch_exceptions=False)
+    result = runner.invoke(app, ["index"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(app, ["doctor"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    # Global settings section
+    assert "Global Settings" in result.output
+    assert "global_settings.yml" in result.output
+    assert "provider=" in result.output
+    assert "model=" in result.output
+
+    # Daemon section
+    assert "Daemon" in result.output
+    assert "Version:" in result.output
+    assert "Uptime:" in result.output
+
+    # Model check
+    assert "[OK] Model Check" in result.output
+    assert "Embedding dimension:" in result.output
+
+    # Project settings section
+    assert "Project Settings" in result.output
+    assert "settings.yml" in result.output
+    assert "Include patterns (" in result.output
+    assert "Exclude patterns (" in result.output
+
+    # File walk
+    assert "[OK] File Walk" in result.output
+    assert "Total matched files:" in result.output
+    # Our sample project has .py files
+    assert ".py:" in result.output
+
+    # Index status
+    assert "[OK] Index Status" in result.output
+    assert "Chunks:" in result.output
+    assert "Files:" in result.output
+
+    # Log files section
+    assert "Log Files" in result.output
+    assert "daemon.log" in result.output
+
+
+def test_session_doctor_no_index(e2e_project: Path) -> None:
+    """Doctor before indexing should show index not created yet."""
+    runner.invoke(app, ["init"], catch_exceptions=False)
+
+    result = runner.invoke(app, ["doctor"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    assert "[OK] Model Check" in result.output
+    assert "Index not created yet" in result.output
+
+
+def test_session_doctor_no_project(e2e_project: Path) -> None:
+    """Doctor outside a project should still show global + daemon checks."""
+    # Init to create global settings and start daemon
+    runner.invoke(app, ["init"], catch_exceptions=False)
+
+    # Move to a standalone directory (not a project)
+    standalone = Path(tempfile.mkdtemp(prefix="ccc_standalone_"))
+    old_cwd = os.getcwd()
+    os.chdir(standalone)
+    try:
+        result = runner.invoke(app, ["doctor"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+
+        # Global + daemon checks should be present
+        assert "Global Settings" in result.output
+        assert "Daemon" in result.output
+        assert "[OK] Model Check" in result.output
+
+        # Project-specific sections should NOT be present
+        assert "Project Settings" not in result.output
+        assert "File Walk" not in result.output
+        assert "Index Status" not in result.output
+
+        # Log files always present
+        assert "Log Files" in result.output
+    finally:
+        os.chdir(old_cwd)
+
+
+# ---------------------------------------------------------------------------
+# Daemon startup failure tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def e2e_project_no_global_settings() -> Iterator[Path]:
+    """Set up a project with project settings but NO global_settings.yml.
+
+    This reproduces the scenario from issue #113 where a user creates project
+    settings manually but hasn't run ``ccc init`` (which creates global settings).
+    """
+    base_dir = Path(tempfile.mkdtemp(prefix="ccc_e2e_"))
+    project_dir = base_dir / "project"
+    project_dir.mkdir()
+    (project_dir / "main.py").write_text(SAMPLE_MAIN_PY)
+    (project_dir / ".git").mkdir()
+
+    old_env = os.environ.get("COCOINDEX_CODE_DIR")
+    os.environ["COCOINDEX_CODE_DIR"] = str(base_dir)
+    old_cwd = os.getcwd()
+    os.chdir(project_dir)
+
+    # Create project settings but NOT global settings — this is the bug scenario
+    save_project_settings(project_dir, default_project_settings())
+
+    try:
+        yield project_dir
+    finally:
+        os.chdir(old_cwd)
+        stop_daemon()
+        if old_env is None:
+            os.environ.pop("COCOINDEX_CODE_DIR", None)
+        else:
+            os.environ["COCOINDEX_CODE_DIR"] = old_env
+
+
+@pytest.mark.usefixtures("e2e_project_no_global_settings")
+def test_session_missing_global_settings_early_error() -> None:
+    """When global_settings.yml is missing, project commands should fail early with guidance."""
+    # `ccc status` should detect missing global settings before even starting the daemon.
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code != 0, f"Expected failure but got: {result.output}"
+    assert "Global settings not found" in result.output
+    assert "global_settings.yml" in result.output
+    assert "ccc init" in result.output
+
+
+@pytest.mark.usefixtures("e2e_project_no_global_settings")
+def test_session_daemon_restart_missing_global_settings() -> None:
+    """``ccc daemon restart`` should fail fast with daemon log when global settings are missing."""
+    # `daemon restart` doesn't go through require_project_root, so it hits the
+    # daemon start path where the process dies. Should show the daemon log.
+    result = runner.invoke(app, ["daemon", "restart"])
+    assert result.exit_code != 0, f"Expected failure but got: {result.output}"
+    assert "Daemon log:" in result.output
+    assert "User settings not found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# DB path mapping tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def e2e_project_with_db_mapping() -> Iterator[tuple[Path, Path]]:
+    """Set up a project with COCOINDEX_CODE_DB_PATH_MAPPING pointing to a separate db dir.
+
+    Yields (project_dir, db_base_dir).
+    """
+    base_dir = Path(tempfile.mkdtemp(prefix="ccc_e2e_"))
+    project_dir = base_dir / "workspace" / "myproject"
+    project_dir.mkdir(parents=True)
+    db_base_dir = base_dir / "db-files"
+    db_base_dir.mkdir()
+
+    (project_dir / "main.py").write_text(SAMPLE_MAIN_PY)
+    (project_dir / ".git").mkdir()
+
+    old_env = {
+        k: os.environ.get(k) for k in ("COCOINDEX_CODE_DIR", "COCOINDEX_CODE_DB_PATH_MAPPING")
+    }
+    os.environ["COCOINDEX_CODE_DIR"] = str(base_dir)
+    workspace = str(base_dir / "workspace")
+    os.environ["COCOINDEX_CODE_DB_PATH_MAPPING"] = f"{workspace}={db_base_dir}"
+    _reset_db_path_mapping_cache()
+    old_cwd = os.getcwd()
+    os.chdir(project_dir)
+
+    try:
+        yield project_dir, db_base_dir
+    finally:
+        os.chdir(project_dir)
+        runner.invoke(app, ["reset", "--all", "-f"])
+        stop_daemon()
+        os.chdir(old_cwd)
+        _reset_db_path_mapping_cache()
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_session_db_path_mapping(
+    e2e_project_with_db_mapping: tuple[Path, Path],
+) -> None:
+    """Init → index → verify databases are in the mapped directory → search works."""
+    project_dir, db_base_dir = e2e_project_with_db_mapping
+    mapped_db_dir = db_base_dir / "myproject"
+
+    # Init
+    result = runner.invoke(app, ["init"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    # Settings should be in the project dir, NOT the mapped dir
+    assert (project_dir / ".cocoindex_code" / "settings.yml").exists()
+
+    # Index
+    result = runner.invoke(app, ["index"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    # Databases should be in the mapped directory
+    assert (mapped_db_dir / "target_sqlite.db").exists()
+    # Databases should NOT be in the project's .cocoindex_code dir
+    assert not (project_dir / ".cocoindex_code" / "target_sqlite.db").exists()
+
+    # Search should work
+    result = runner.invoke(app, ["search", "fibonacci"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "main.py" in result.output
+
+    # Reset should clean databases from the mapped dir
+    result = runner.invoke(app, ["reset", "-f"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert not (mapped_db_dir / "target_sqlite.db").exists()
+    # Settings still in place
+    assert (project_dir / ".cocoindex_code" / "settings.yml").exists()
 
 
 # ---------------------------------------------------------------------------

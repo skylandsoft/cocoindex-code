@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TypeVar
 
 import typer as _typer
 
-if TYPE_CHECKING:
-    from .client import DaemonClient
-
-from .protocol import IndexingProgress, ProjectStatusResponse, SearchResponse
+from .client import DaemonStartError
+from .protocol import DoctorCheckResult, IndexingProgress, ProjectStatusResponse, SearchResponse
 from .settings import (
+    cocoindex_db_path,
     default_project_settings,
     default_user_settings,
     find_parent_with_marker,
     find_project_root,
+    project_settings_path,
+    resolve_db_dir,
     save_project_settings,
     save_user_settings,
+    target_sqlite_db_path,
     user_settings_path,
 )
 
@@ -39,8 +43,17 @@ app.add_typer(daemon_app, name="daemon")
 def require_project_root() -> Path:
     """Find the project root by walking up from CWD.
 
-    Exits with code 1 if not found.
+    Checks global settings first (more fundamental), then project settings.
+    Exits with code 1 if either check fails.
     """
+    gs_path = user_settings_path()
+    if not gs_path.is_file():
+        _typer.echo(
+            f"Error: Global settings not found: {gs_path}\n"
+            "Run `ccc init` to create it with default settings.",
+            err=True,
+        )
+        raise _typer.Exit(code=1)
     root = find_project_root(Path.cwd())
     if root is None:
         _typer.echo(
@@ -52,20 +65,24 @@ def require_project_root() -> Path:
     return root
 
 
-def require_daemon_for_project() -> tuple[DaemonClient, str]:
-    """Resolve project root, then connect to daemon (auto-starting if needed).
+_F = TypeVar("_F", bound=Callable[..., object])
 
-    Returns ``(client, project_root_str)``. Exits on failure.
+
+def _catch_daemon_start_error(func: _F) -> _F:
+    """Decorator that catches ``DaemonStartError`` and exits with a clean message.
+
+    Apply to any CLI command that may trigger daemon auto-start.
     """
-    from .client import ensure_daemon
 
-    project_root = require_project_root()
-    try:
-        client = ensure_daemon()
-    except Exception as e:
-        _typer.echo(f"Error: Failed to connect to daemon: {e}", err=True)
-        raise _typer.Exit(code=1)
-    return client, str(project_root)
+    @functools.wraps(func)
+    def wrapper(*args: object, **kwargs: object) -> object:
+        try:
+            return func(*args, **kwargs)
+        except DaemonStartError as e:
+            _typer.echo(f"Error: {e}", err=True)
+            raise _typer.Exit(code=1)
+
+    return wrapper  # type: ignore[return-value]
 
 
 def resolve_default_path(project_root: Path) -> str | None:
@@ -101,7 +118,7 @@ def print_index_stats(status: ProjectStatusResponse) -> None:
     if status.progress is not None:
         _typer.echo(f"Indexing in progress: {_format_progress(status.progress)}")
     if not status.index_exists:
-        _typer.echo("\nIndex not created yet. Run `ccc index` to build the index.")
+        _typer.echo("\nIndex not created yet.")
         return
     _typer.echo("\nIndex stats:")
     _typer.echo(f"  Chunks: {status.total_chunks}")
@@ -128,11 +145,13 @@ def print_search_results(response: SearchResponse) -> None:
         _typer.echo(r.content)
 
 
-def _run_index_with_progress(client: DaemonClient, project_root: str) -> None:
+def _run_index_with_progress(project_root: str) -> None:
     """Run indexing with streaming progress display. Exits on failure."""
     from rich.console import Console as _Console
     from rich.live import Live as _Live
     from rich.spinner import Spinner as _Spinner
+
+    from . import client as _client
 
     err_console = _Console(stderr=True)
     last_progress_line: str | None = None
@@ -153,9 +172,12 @@ def _run_index_with_progress(client: DaemonClient, project_root: str) -> None:
             live.update(_Spinner("dots", last_progress_line))
 
         try:
-            resp = client.index(project_root, on_progress=_on_progress, on_waiting=_on_waiting)
+            resp = _client.index(project_root, on_progress=_on_progress, on_waiting=_on_waiting)
         except RuntimeError as e:
             live.stop()
+            # Let DaemonStartError propagate to the decorator for consistent handling.
+            if isinstance(e, DaemonStartError):
+                raise
             _typer.echo(f"Indexing failed: {e}", err=True)
             raise _typer.Exit(code=1)
 
@@ -169,7 +191,6 @@ def _run_index_with_progress(client: DaemonClient, project_root: str) -> None:
 
 
 def _search_with_wait_spinner(
-    client: DaemonClient,
     project_root: str,
     query: str,
     languages: list[str] | None = None,
@@ -182,6 +203,8 @@ def _search_with_wait_spinner(
     from rich.live import Live as _Live
     from rich.spinner import Spinner as _Spinner
 
+    from . import client as _client
+
     err_console = _Console(stderr=True)
 
     with _Live(_Spinner("dots", "Searching..."), console=err_console, transient=True) as live:
@@ -192,7 +215,7 @@ def _search_with_wait_spinner(
                 refresh=True,
             )
 
-        resp = client.search(
+        resp = _client.search(
             project_root=project_root,
             query=query,
             languages=languages,
@@ -264,10 +287,14 @@ def init(
     force: bool = _typer.Option(False, "-f", "--force", help="Skip parent directory warning"),
 ) -> None:
     """Initialize a project for cocoindex-code."""
-    from .settings import project_settings_path as _project_settings_path
-
     cwd = Path.cwd().resolve()
-    settings_file = _project_settings_path(cwd)
+    settings_file = project_settings_path(cwd)
+
+    # Always ensure user settings exist
+    user_path = user_settings_path()
+    if not user_path.is_file():
+        save_user_settings(default_user_settings())
+        _typer.echo(f"Created user settings: {user_path}")
 
     # Check if already initialized
     if settings_file.is_file():
@@ -285,12 +312,6 @@ def init(
             )
             raise _typer.Exit(code=1)
 
-    # Create user settings if missing
-    user_path = user_settings_path()
-    if not user_path.is_file():
-        save_user_settings(default_user_settings())
-        _typer.echo(f"Created user settings: {user_path}")
-
     # Create project settings
     save_project_settings(cwd, default_project_settings())
     _typer.echo(f"Created project settings: {settings_file}")
@@ -303,18 +324,19 @@ def init(
 
 
 @app.command()
+@_catch_daemon_start_error
 def index() -> None:
     """Create/update index for the codebase."""
-    client, project_root = require_daemon_for_project()
+    from . import client as _client
+
+    project_root = str(require_project_root())
     print_project_header(project_root)
-
-    _run_index_with_progress(client, project_root)
-
-    status = client.project_status(project_root)
-    print_index_stats(status)
+    _run_index_with_progress(project_root)
+    print_index_stats(_client.project_status(project_root))
 
 
 @app.command()
+@_catch_daemon_start_error
 def search(
     query: list[str] = _typer.Argument(..., help="Search query"),
     lang: list[str] = _typer.Option([], "--lang", help="Filter by language"),
@@ -324,12 +346,11 @@ def search(
     refresh: bool = _typer.Option(False, "--refresh", help="Refresh index before searching"),
 ) -> None:
     """Semantic search across the codebase."""
-    client, project_root = require_daemon_for_project()
+    project_root = str(require_project_root())
     query_str = " ".join(query)
 
-    # Refresh index with progress display before searching
     if refresh:
-        _run_index_with_progress(client, project_root)
+        _run_index_with_progress(project_root)
 
     # Default path filter from CWD
     paths: list[str] | None = None
@@ -341,7 +362,6 @@ def search(
             paths = [default]
 
     resp = _search_with_wait_spinner(
-        client,
         project_root=project_root,
         query=query_str,
         languages=lang or None,
@@ -353,12 +373,21 @@ def search(
 
 
 @app.command()
+@_catch_daemon_start_error
 def status() -> None:
     """Show project status."""
-    client, project_root = require_daemon_for_project()
+    from . import client as _client
+
+    project_root_path = require_project_root()
+    project_root = str(project_root_path)
     print_project_header(project_root)
-    resp = client.project_status(project_root)
-    print_index_stats(resp)
+
+    _typer.echo(f"Settings: {project_settings_path(project_root_path)}")
+    db_path = target_sqlite_db_path(project_root_path)
+    if db_path.exists():
+        _typer.echo(f"Index DB: {db_path}")
+
+    print_index_stats(_client.project_status(project_root))
 
 
 @app.command()
@@ -369,12 +398,13 @@ def reset(
     """Reset project databases and optionally remove settings."""
     project_root = require_project_root()
     cocoindex_dir = project_root / ".cocoindex_code"
+    db_dir = resolve_db_dir(project_root)
 
     db_files = [
-        cocoindex_dir / "cocoindex.db",
-        cocoindex_dir / "target_sqlite.db",
+        cocoindex_db_path(project_root),
+        target_sqlite_db_path(project_root),
     ]
-    settings_file = cocoindex_dir / "settings.yml"
+    settings_file = project_settings_path(project_root)
 
     # Determine what will be deleted
     to_delete = [f for f in db_files if f.exists()]
@@ -400,12 +430,9 @@ def reset(
 
     # Remove project from daemon first so it releases file handles
     try:
-        from .client import DaemonClient
+        from . import client as _client
 
-        client = DaemonClient.connect()
-        client.handshake()
-        client.remove_project(str(project_root))
-        client.close()
+        _client.remove_project(str(project_root))
     except (ConnectionRefusedError, OSError, RuntimeError):
         pass  # Daemon not running — that's fine
 
@@ -419,6 +446,12 @@ def reset(
             f.unlink(missing_ok=True)
 
     if all_:
+        # Remove db_dir if empty and different from cocoindex_dir
+        if db_dir != cocoindex_dir:
+            try:
+                db_dir.rmdir()
+            except OSError:
+                pass  # Not empty or doesn't exist
         # Remove .cocoindex_code/ if empty
         try:
             cocoindex_dir.rmdir()
@@ -437,18 +470,153 @@ def reset(
             )
 
 
+def _print_section(name: str) -> None:
+    import click as _click
+
+    _typer.echo()
+    _typer.echo(_click.style(f"  {name}", bold=True))
+    _typer.echo(_click.style(f"  {'─' * 38}", fg="bright_black"))
+
+
+def _print_error(msg: str) -> None:
+    import click as _click
+
+    _typer.echo(_click.style(f"  ERROR: {msg}", fg="red"), err=True)
+
+
+def _print_doctor_result(result: DoctorCheckResult) -> None:
+    import click as _click
+
+    if result.name == "done":
+        return
+    if result.ok:
+        tag = _click.style("[OK]", fg="green", bold=True)
+    else:
+        tag = _click.style("[FAIL]", fg="red", bold=True)
+    _typer.echo(f"\n  {tag} {result.name}")
+    for line in result.details:
+        _typer.echo(f"    {line}")
+    for err in result.errors:
+        _typer.echo(_click.style(f"    ERROR: {err}", fg="red"), err=True)
+
+
 @app.command()
+@_catch_daemon_start_error
+def doctor() -> None:
+    """Check system health and report issues."""
+    from . import client as _client
+    from .settings import (
+        load_project_settings as _load_project_settings,
+    )
+    from .settings import (
+        load_user_settings as _load_user_settings,
+    )
+
+    # --- 1. Global settings (local, no daemon needed) ---
+    _print_section("Global Settings")
+    settings_path = user_settings_path()
+    _typer.echo(f"  Settings: {settings_path}")
+    try:
+        user_settings = _load_user_settings()
+        emb = user_settings.embedding
+        device_str = f", device={emb.device}" if emb.device else ""
+        _typer.echo(f"  Embedding: provider={emb.provider}, model={emb.model}{device_str}")
+        if user_settings.envs:
+            _typer.echo(
+                f"  Env vars (from settings): {', '.join(sorted(user_settings.envs.keys()))}"
+            )
+    except (FileNotFoundError, ValueError) as e:
+        _print_error(str(e))
+
+    # --- 2. Connect to daemon (handshake with auto-start/restart) ---
+    _print_section("Daemon")
+    daemon_ok = False
+    try:
+        status = _client.daemon_status()
+        _typer.echo(f"  Version: {status.version}")
+        _typer.echo(f"  Uptime: {status.uptime_seconds:.1f}s")
+        _typer.echo(f"  Loaded projects: {len(status.projects)}")
+        daemon_ok = True
+    except Exception as e:
+        _print_error(f"Cannot connect to daemon: {e}")
+        _typer.echo("  Remaining daemon-side checks will be skipped.")
+
+    # --- 3. Daemon environment (requires daemon) ---
+    if daemon_ok:
+        try:
+            env_resp = _client.daemon_env()
+            settings_keys = set(env_resp.settings_env_names)
+            other_keys = [k for k in env_resp.env_names if k not in settings_keys]
+            if other_keys:
+                _typer.echo(f"  Other env vars in daemon: {', '.join(sorted(other_keys))}")
+            if env_resp.db_path_mappings:
+                _typer.echo("  DB path mappings:")
+                for m in env_resp.db_path_mappings:
+                    _typer.echo(f"    {m.source} \u2192 {m.target}")
+        except Exception as e:
+            _print_error(f"Failed to get daemon env: {e}")
+
+    # --- 4. Model check (daemon-side, global — before project checks) ---
+    if daemon_ok:
+        try:
+            _client.doctor(
+                project_root=None,
+                on_result=_print_doctor_result,
+            )
+        except Exception as e:
+            _print_error(f"Model check failed: {e}")
+
+    # --- 5. Detect project ---
+    project_root = find_project_root(Path.cwd())
+
+    # --- 6. Project settings (local, no daemon needed) ---
+    if project_root is not None:
+        _print_section("Project Settings")
+        ps_path = project_settings_path(project_root)
+        _typer.echo(f"  Settings: {ps_path}")
+        try:
+            ps = _load_project_settings(project_root)
+            _typer.echo(f"  Include patterns ({len(ps.include_patterns)}):")
+            _typer.echo(f"    {', '.join(ps.include_patterns)}")
+            _typer.echo(f"  Exclude patterns ({len(ps.exclude_patterns)}):")
+            _typer.echo(f"    {', '.join(ps.exclude_patterns)}")
+            if ps.language_overrides:
+                _typer.echo("  Language overrides:")
+                for lo in ps.language_overrides:
+                    _typer.echo(f"    .{lo.ext} -> {lo.lang}")
+        except (FileNotFoundError, ValueError) as e:
+            _print_error(str(e))
+
+    # --- 7. Project daemon-side checks (file walk + index status) ---
+    if daemon_ok and project_root is not None:
+        try:
+            _client.doctor(
+                project_root=str(project_root),
+                on_result=_print_doctor_result,
+            )
+        except Exception as e:
+            _print_error(f"Project checks failed: {e}")
+
+    # --- 8. Log files ---
+    _print_section("Log Files")
+    from .daemon import daemon_log_path as _daemon_log_path
+
+    _typer.echo(f"  Daemon logs: {_daemon_log_path()}")
+    _typer.echo("  Check logs above for further troubleshooting.")
+
+
+@app.command()
+@_catch_daemon_start_error
 def mcp() -> None:
     """Run as MCP server (stdio mode)."""
     import asyncio
 
-    client, project_root = require_daemon_for_project()
+    project_root = str(require_project_root())
 
     async def _run_mcp() -> None:
         from .server import create_mcp_server
 
-        mcp_server = create_mcp_server(client, project_root)
-        # Trigger initial indexing in background
+        mcp_server = create_mcp_server(project_root)
         asyncio.create_task(_bg_index(project_root))
         await mcp_server.run_stdio_async()
 
@@ -456,27 +624,14 @@ def mcp() -> None:
 
 
 async def _bg_index(project_root: str) -> None:
-    """Index in background using a dedicated daemon connection.
-
-    A fresh DaemonClient is used so that background indexing does not share
-    the multiprocessing connection used by foreground MCP requests, which
-    would corrupt data ("Input data was truncated").
-    """
+    """Index in background. Each call opens its own daemon connection."""
     import asyncio
 
-    from .client import ensure_daemon
+    from . import client as _client
 
     loop = asyncio.get_event_loop()
-
-    def _run_index() -> None:
-        bg_client = ensure_daemon()
-        try:
-            bg_client.index(project_root)
-        finally:
-            bg_client.close()
-
     try:
-        await loop.run_in_executor(None, _run_index)
+        await loop.run_in_executor(None, lambda: _client.index(project_root))
     except Exception:
         pass
 
@@ -485,17 +640,12 @@ async def _bg_index(project_root: str) -> None:
 
 
 @daemon_app.command("status")
+@_catch_daemon_start_error
 def daemon_status() -> None:
     """Show daemon status."""
-    from .client import ensure_daemon
+    from . import client as _client
 
-    try:
-        client = ensure_daemon()
-    except Exception as e:
-        _typer.echo(f"Error: {e}", err=True)
-        raise _typer.Exit(code=1)
-
-    resp = client.daemon_status()
+    resp = _client.daemon_status()
     _typer.echo(f"Daemon version: {resp.version}")
     _typer.echo(f"Uptime: {resp.uptime_seconds:.1f}s")
     if resp.projects:
@@ -505,10 +655,10 @@ def daemon_status() -> None:
             _typer.echo(f"  {p.project_root} [{state}]")
     else:
         _typer.echo("No projects loaded.")
-    client.close()
 
 
 @daemon_app.command("restart")
+@_catch_daemon_start_error
 def daemon_restart() -> None:
     """Restart the daemon."""
     from .client import _wait_for_daemon, start_daemon, stop_daemon
@@ -517,13 +667,9 @@ def daemon_restart() -> None:
     stop_daemon()
 
     _typer.echo("Starting daemon...")
-    start_daemon()
-    try:
-        _wait_for_daemon()
-        _typer.echo("Daemon restarted.")
-    except TimeoutError:
-        _typer.echo("Error: Daemon did not start in time.", err=True)
-        raise _typer.Exit(code=1)
+    proc = start_daemon()
+    _wait_for_daemon(proc=proc)
+    _typer.echo("Daemon restarted.")
 
 
 @daemon_app.command("stop")

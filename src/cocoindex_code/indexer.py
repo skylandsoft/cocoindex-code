@@ -14,12 +14,11 @@ from cocoindex.resources.file import FilePathMatcher, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
 from pathspec import GitIgnoreSpec
 
-from .settings import PROJECT_SETTINGS
+from .chunking import CHUNKER_REGISTRY
+from .settings import load_gitignore_spec, load_project_settings
 from .shared import (
     CODEBASE_DIR,
     EMBEDDER,
-    EXT_LANG_OVERRIDE_MAP,
-    GITIGNORE_SPEC,
     SQLITE_DB,
     CodeChunk,
 )
@@ -151,20 +150,29 @@ async def process_file(
         return
 
     suffix = file.file_path.path.suffix
-    ext_lang_override_map = coco.use_context(EXT_LANG_OVERRIDE_MAP)
+    project_root = coco.use_context(CODEBASE_DIR)
+    ps = load_project_settings(project_root)
+    ext_lang_map = {f".{lo.ext}": lo.lang for lo in ps.language_overrides}
     language = (
-        ext_lang_override_map.get(suffix)
+        ext_lang_map.get(suffix)
         or detect_code_language(filename=file.file_path.path.name)
         or "text"
     )
 
-    chunks = splitter.split(
-        content,
-        chunk_size=CHUNK_SIZE,
-        min_chunk_size=MIN_CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        language=language,
-    )
+    chunker_registry = coco.use_context(CHUNKER_REGISTRY)
+    chunker = chunker_registry.get(suffix)
+    if chunker is not None:
+        language_override, chunks = chunker(Path(file.file_path.path), content)
+        if language_override is not None:
+            language = language_override
+    else:
+        chunks = splitter.split(
+            content,
+            chunk_size=CHUNK_SIZE,
+            min_chunk_size=MIN_CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            language=language,
+        )
 
     id_gen = IdGenerator()
 
@@ -187,9 +195,9 @@ async def process_file(
 @coco.fn
 async def indexer_main() -> None:
     """Main indexing function - walks files and processes each."""
-    ps = coco.use_context(PROJECT_SETTINGS)
-    gitignore_spec = coco.use_context(GITIGNORE_SPEC)
     project_root = coco.use_context(CODEBASE_DIR)
+    ps = load_project_settings(project_root)
+    gitignore_spec = load_gitignore_spec(project_root)
 
     table = await sqlite.mount_table_target(
         db=SQLITE_DB,

@@ -1,4 +1,9 @@
-"""Client for communicating with the daemon."""
+"""Client for communicating with the daemon.
+
+Per-request connection model: each function opens a fresh connection,
+performs the version handshake, sends one request, reads the response(s),
+and closes.  There is no persistent connection object.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +18,14 @@ from multiprocessing.connection import Client, Connection
 from pathlib import Path
 
 from ._version import __version__
-from .daemon import _connection_family, daemon_pid_path, daemon_socket_path
+from .daemon import _connection_family, daemon_log_path, daemon_pid_path, daemon_socket_path
 from .protocol import (
+    DaemonEnvRequest,
+    DaemonEnvResponse,
     DaemonStatusResponse,
+    DoctorCheckResult,
+    DoctorRequest,
+    DoctorResponse,
     ErrorResponse,
     HandshakeRequest,
     HandshakeResponse,
@@ -41,41 +51,154 @@ from .protocol import (
 logger = logging.getLogger(__name__)
 
 
-class DaemonClient:
-    """Client for communicating with the daemon."""
+# ---------------------------------------------------------------------------
+# Per-request connection helpers
+# ---------------------------------------------------------------------------
 
-    _conn: Connection
 
-    def __init__(self, conn: Connection) -> None:
-        self._conn = conn
+_daemon_ensured = False
 
-    @classmethod
-    def connect(cls) -> DaemonClient:
-        """Connect to daemon. Raises ConnectionRefusedError if not running."""
-        sock = daemon_socket_path()
-        if not os.path.exists(sock):
-            raise ConnectionRefusedError(f"Daemon socket not found: {sock}")
+
+def _connect_and_handshake() -> Connection:
+    """Connect to the daemon and perform the version handshake.
+
+    Returns the open connection for the caller to send exactly one request.
+
+    On the first call, automatically starts or
+    restarts the daemon if needed.  Subsequent calls fail fast with
+    ``DaemonVersionError`` on mismatch (indicating the daemon was replaced
+    mid-session, e.g. after a tool upgrade).
+    """
+    global _daemon_ensured  # noqa: PLW0603
+
+    if _daemon_ensured:
+        return _raw_connect_and_handshake()
+
+    # First connection — auto-start/restart as needed.
+    try:
+        conn = _raw_connect_and_handshake()
+        _daemon_ensured = True
+        return conn
+    except DaemonVersionError:
+        stop_daemon()
+    except (ConnectionRefusedError, OSError):
+        pass
+
+    proc = start_daemon()
+    _wait_for_daemon(proc=proc)
+
+    # Verify the fresh daemon is reachable
+    for _attempt in range(10):
         try:
-            conn = Client(sock, family=_connection_family())
-        except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
-            raise ConnectionRefusedError(f"Cannot connect to daemon: {e}") from e
-        return cls(conn)
+            conn = _raw_connect_and_handshake()
+            _daemon_ensured = True
+            return conn
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.5)
 
-    def handshake(self) -> HandshakeResponse:
-        """Send version handshake."""
-        return self._send(HandshakeRequest(version=__version__))  # type: ignore[return-value]
+    raise RuntimeError("Failed to connect to daemon after starting it")
 
-    def index(
-        self,
-        project_root: str,
-        on_progress: Callable[[IndexingProgress], None] | None = None,
-        on_waiting: Callable[[], None] | None = None,
-    ) -> IndexResponse:
-        """Request indexing with streaming progress. Blocks until complete."""
-        self._conn.send_bytes(encode_request(IndexRequest(project_root=project_root)))
+
+def _raw_connect_and_handshake() -> Connection:
+    """Low-level connect + handshake without auto-start logic."""
+    sock = daemon_socket_path()
+    if sys.platform != "win32" and not os.path.exists(sock):
+        raise ConnectionRefusedError(f"Daemon socket not found: {sock}")
+    try:
+        conn = Client(sock, family=_connection_family())
+    except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+        raise ConnectionRefusedError(f"Cannot connect to daemon: {e}") from e
+
+    try:
+        conn.send_bytes(encode_request(HandshakeRequest(version=__version__)))
+        data = conn.recv_bytes()
+    except (EOFError, OSError) as e:
+        conn.close()
+        raise ConnectionRefusedError(f"Handshake failed: {e}") from e
+
+    resp = decode_response(data)
+    if isinstance(resp, ErrorResponse):
+        conn.close()
+        raise RuntimeError(f"Daemon error: {resp.message}")
+    if not isinstance(resp, HandshakeResponse):
+        conn.close()
+        raise RuntimeError(f"Unexpected handshake response: {type(resp).__name__}")
+    if not resp.ok or _needs_restart(resp):
+        conn.close()
+        raise DaemonVersionError(resp)
+    return conn
+
+
+class DaemonVersionError(RuntimeError):
+    """Raised when the daemon has a version or settings mismatch.
+
+    The first ``_connect_and_handshake()`` call handles this by restarting
+    the daemon.  If a mismatch occurs on a subsequent call, it means the
+    daemon was replaced mid-session (e.g. after a tool upgrade).
+    """
+
+    def __init__(self, resp: HandshakeResponse) -> None:
+        self.resp = resp
+        super().__init__(
+            f"Daemon version mismatch (daemon={resp.daemon_version}, "
+            f"client={__version__}). Please retry — the daemon may need a restart."
+        )
+
+
+class DaemonStartError(RuntimeError):
+    """Raised when the daemon process fails to start.
+
+    Carries the daemon log content so callers can display it to the user.
+    """
+
+    def __init__(self, message: str, log: str | None = None) -> None:
+        self.log = log
+        super().__init__(message)
+
+
+def _read_daemon_log() -> str | None:
+    """Read the daemon log file, returning its content or None."""
+    log_path = daemon_log_path()
+    try:
+        content = log_path.read_text().strip()
+        return content if content else None
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _send(req: Request) -> Response:
+    """Open connection, handshake, send one request, read one response, close."""
+    conn = _connect_and_handshake()
+    try:
+        conn.send_bytes(encode_request(req))
+        data = conn.recv_bytes()
+    except (EOFError, OSError) as e:
+        raise RuntimeError(f"Connection to daemon lost: {e}") from e
+    finally:
+        conn.close()
+    resp = decode_response(data)
+    if isinstance(resp, ErrorResponse):
+        raise RuntimeError(f"Daemon error: {resp.message}")
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Public API — one function per request type
+# ---------------------------------------------------------------------------
+
+
+def index(
+    project_root: str,
+    on_progress: Callable[[IndexingProgress], None] | None = None,
+    on_waiting: Callable[[], None] | None = None,
+) -> IndexResponse:
+    """Request indexing with streaming progress. Blocks until complete."""
+    conn = _connect_and_handshake()
+    try:
+        conn.send_bytes(encode_request(IndexRequest(project_root=project_root)))
         while True:
             try:
-                data = self._conn.recv_bytes()
+                data = conn.recv_bytes()
             except EOFError:
                 raise RuntimeError("Connection to daemon lost during indexing")
             resp = decode_response(data)
@@ -92,24 +215,28 @@ class DaemonClient:
             if isinstance(resp, IndexResponse):
                 return resp
             raise RuntimeError(f"Unexpected response: {type(resp).__name__}")
+    finally:
+        conn.close()
 
-    def search(
-        self,
-        project_root: str,
-        query: str,
-        languages: list[str] | None = None,
-        paths: list[str] | None = None,
-        limit: int = 5,
-        offset: int = 0,
-        on_waiting: Callable[[], None] | None = None,
-    ) -> SearchResponse:
-        """Search the codebase.
 
-        If the daemon sends ``IndexWaitingNotice`` (load-time indexing in
-        progress), calls *on_waiting* (if provided) then continues reading
-        until the final ``SearchResponse``.
-        """
-        self._conn.send_bytes(
+def search(
+    project_root: str,
+    query: str,
+    languages: list[str] | None = None,
+    paths: list[str] | None = None,
+    limit: int = 5,
+    offset: int = 0,
+    on_waiting: Callable[[], None] | None = None,
+) -> SearchResponse:
+    """Search the codebase.
+
+    If the daemon sends ``IndexWaitingNotice`` (load-time indexing in
+    progress), calls *on_waiting* (if provided) then continues reading
+    until the final ``SearchResponse``.
+    """
+    conn = _connect_and_handshake()
+    try:
+        conn.send_bytes(
             encode_request(
                 SearchRequest(
                     project_root=project_root,
@@ -123,7 +250,7 @@ class DaemonClient:
         )
         while True:
             try:
-                data = self._conn.recv_bytes()
+                data = conn.recv_bytes()
             except EOFError:
                 raise RuntimeError("Connection to daemon lost during search")
             resp = decode_response(data)
@@ -136,38 +263,61 @@ class DaemonClient:
             if isinstance(resp, SearchResponse):
                 return resp
             raise RuntimeError(f"Unexpected response: {type(resp).__name__}")
+    finally:
+        conn.close()
 
-    def project_status(self, project_root: str) -> ProjectStatusResponse:
-        return self._send(  # type: ignore[return-value]
-            ProjectStatusRequest(project_root=project_root)
-        )
 
-    def daemon_status(self) -> DaemonStatusResponse:
-        from .protocol import DaemonStatusRequest
+def project_status(project_root: str) -> ProjectStatusResponse:
+    return _send(ProjectStatusRequest(project_root=project_root))  # type: ignore[return-value]
 
-        return self._send(DaemonStatusRequest())  # type: ignore[return-value]
 
-    def remove_project(self, project_root: str) -> RemoveProjectResponse:
-        return self._send(  # type: ignore[return-value]
-            RemoveProjectRequest(project_root=project_root)
-        )
+def daemon_status() -> DaemonStatusResponse:
+    from .protocol import DaemonStatusRequest
 
-    def stop(self) -> StopResponse:
-        return self._send(StopRequest())  # type: ignore[return-value]
+    return _send(DaemonStatusRequest())  # type: ignore[return-value]
 
-    def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:
-            pass
 
-    def _send(self, req: Request) -> Response:
-        self._conn.send_bytes(encode_request(req))
-        data = self._conn.recv_bytes()
-        resp = decode_response(data)
-        if isinstance(resp, ErrorResponse):
-            raise RuntimeError(f"Daemon error: {resp.message}")
-        return resp
+def remove_project(project_root: str) -> RemoveProjectResponse:
+    return _send(RemoveProjectRequest(project_root=project_root))  # type: ignore[return-value]
+
+
+def stop() -> StopResponse:
+    return _send(StopRequest())  # type: ignore[return-value]
+
+
+def daemon_env() -> DaemonEnvResponse:
+    """Get environment variable names from the daemon."""
+    return _send(DaemonEnvRequest())  # type: ignore[return-value]
+
+
+def doctor(
+    project_root: str | None = None,
+    on_result: Callable[[DoctorCheckResult], None] | None = None,
+) -> list[DoctorCheckResult]:
+    """Run doctor checks via daemon, streaming results to on_result callback."""
+    conn = _connect_and_handshake()
+    try:
+        conn.send_bytes(encode_request(DoctorRequest(project_root=project_root)))
+        results: list[DoctorCheckResult] = []
+        while True:
+            try:
+                data = conn.recv_bytes()
+            except EOFError:
+                raise RuntimeError("Connection to daemon lost during doctor checks")
+            resp = decode_response(data)
+            if isinstance(resp, ErrorResponse):
+                raise RuntimeError(f"Daemon error: {resp.message}")
+            if isinstance(resp, DoctorResponse):
+                results.append(resp.result)
+                if on_result is not None:
+                    on_result(resp.result)
+                if resp.final:
+                    break
+            else:
+                raise RuntimeError(f"Unexpected response: {type(resp).__name__}")
+        return results
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +328,6 @@ class DaemonClient:
 def is_daemon_running() -> bool:
     """Check if the daemon is running."""
     if sys.platform == "win32":
-        # os.path.exists is unreliable for Windows named pipes;
-        # try connecting instead.
         try:
             conn = Client(daemon_socket_path(), family=_connection_family())
             conn.close()
@@ -189,27 +337,27 @@ def is_daemon_running() -> bool:
     return os.path.exists(daemon_socket_path())
 
 
-def start_daemon() -> None:
-    """Start the daemon as a background process."""
-    from .daemon import daemon_dir
+def start_daemon() -> subprocess.Popen[bytes]:
+    """Start the daemon as a background process.
+
+    Returns the ``Popen`` object so callers can detect early process death
+    (via ``proc.poll()``) instead of waiting for a full timeout.
+    """
+    from .daemon import daemon_dir, daemon_log_path
 
     daemon_dir().mkdir(parents=True, exist_ok=True)
-    log_path = daemon_dir() / "daemon.log"
+    log_path = daemon_log_path()
 
-    # Use the ccc entry point if available, otherwise fall back to python -m
     ccc_path = _find_ccc_executable()
     if ccc_path:
         cmd = [ccc_path, "run-daemon"]
     else:
         cmd = [sys.executable, "-m", "cocoindex_code.cli", "run-daemon"]
 
-    log_fd = open(log_path, "a")
+    log_fd = open(log_path, "w")
     if sys.platform == "win32":
-        # CREATE_NO_WINDOW prevents the daemon from showing a visible
-        # console window.  DETACHED_PROCESS alone is not sufficient —
-        # it detaches from the parent console but still creates a new one.
         _create_no_window = 0x08000000
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdout=log_fd,
             stderr=log_fd,
@@ -217,7 +365,7 @@ def start_daemon() -> None:
             creationflags=_create_no_window,
         )
     else:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             start_new_session=True,
             stdout=log_fd,
@@ -225,12 +373,12 @@ def start_daemon() -> None:
             stdin=subprocess.DEVNULL,
         )
     log_fd.close()
+    return proc
 
 
 def _find_ccc_executable() -> str | None:
     """Find the ccc executable in PATH or the same directory as python."""
     python_dir = Path(sys.executable).parent
-    # On Windows the script is ccc.exe; on Unix it's just ccc
     names = ["ccc.exe", "ccc"] if sys.platform == "win32" else ["ccc"]
     for name in names:
         ccc = python_dir / name
@@ -242,10 +390,6 @@ def _find_ccc_executable() -> str | None:
 def _pid_alive(pid: int) -> bool:
     """Return True if *pid* is still running."""
     if sys.platform == "win32":
-        # Avoid os.kill(pid, 0) on Windows — it has a CPython bug that corrupts
-        # the C-level exception state, causing subsequent C function calls
-        # (time.monotonic, time.sleep) to raise SystemError even after the
-        # OSError is caught.  Use OpenProcess via ctypes instead.
         import ctypes
 
         kernel32 = getattr(ctypes, "windll").kernel32
@@ -255,95 +399,82 @@ def _pid_alive(pid: int) -> bool:
             return True
         return False
     try:
-        os.kill(pid, 0)  # signal 0: check existence without killing
+        os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True  # process exists but we can't signal it
+        return True
+
+
+def _wait_for_daemon_exit(timeout: float) -> bool:
+    """Wait up to *timeout* seconds for the daemon to finish cleanup.
+
+    Returns True when the daemon's PID file is gone (meaning it completed its
+    shutdown sequence).  This is more reliable than checking process liveness
+    because the daemon process may linger as a zombie.
+    """
+    pid_path = daemon_pid_path()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_path.exists():
+            return True
+        time.sleep(0.1)
+    return not pid_path.exists()
 
 
 def stop_daemon() -> None:
     """Stop the daemon gracefully.
 
-    Sends a StopRequest, waits for the process to exit, falls back to
-    SIGTERM → SIGKILL.  Only removes the PID file after confirming that
-    the specific PID is no longer alive.
+    Escalation: StopRequest → SIGTERM → SIGKILL.
     """
+    global _daemon_ensured  # noqa: PLW0603
+    _daemon_ensured = False
     pid_path = daemon_pid_path()
 
-    # Read the PID early so we can track the actual process.
     pid: int | None = None
     try:
         pid = int(pid_path.read_text().strip())
         if pid == os.getpid():
-            pid = None  # safety: never kill ourselves
+            pid = None
     except (FileNotFoundError, ValueError):
         pass
 
-    # Step 1: try sending StopRequest via socket
+    # 1) Graceful StopRequest via socket (bypass auto-start)
     try:
-        client = DaemonClient.connect()
-        client.handshake()
-        client.stop()
-        client.close()
-    except (ConnectionRefusedError, OSError, RuntimeError):
+        conn = _raw_connect_and_handshake()
+        try:
+            conn.send_bytes(encode_request(StopRequest()))
+            conn.recv_bytes()
+        finally:
+            conn.close()
+    except (ConnectionRefusedError, OSError, RuntimeError, DaemonVersionError):
         pass
 
-    # Step 2: wait for process to exit (up to 5s)
-    if pid is not None:
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and _pid_alive(pid):
-            time.sleep(0.1)
-        if not _pid_alive(pid):
-            _cleanup_stale_files(pid_path, pid)
-            return
+    if _wait_for_daemon_exit(timeout=3.0):
+        return
 
-    # Step 3: if still running, try SIGTERM
+    # 2) SIGTERM
     if pid is not None and _pid_alive(pid):
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
-
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and _pid_alive(pid):
-            time.sleep(0.1)
-
-        if not _pid_alive(pid):
-            _cleanup_stale_files(pid_path, pid)
+        if _wait_for_daemon_exit(timeout=2.0):
             return
 
-    # Step 4: escalate to SIGKILL (Unix only;
-    # on Windows SIGTERM already calls TerminateProcess)
+    # 3) SIGKILL (Unix) — on Windows SIGTERM already calls TerminateProcess
     if sys.platform != "win32" and pid is not None and _pid_alive(pid):
         try:
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
-        # SIGKILL is async; give the kernel a moment to reap
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline and _pid_alive(pid):
-            time.sleep(0.1)
-
-    # Step 4b: on Windows, wait for the process to fully exit after TerminateProcess
-    # so that named pipe handles are released before starting a new daemon.
-    if sys.platform == "win32" and pid is not None:
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and _pid_alive(pid):
-            time.sleep(0.1)
-
-    # Step 5: clean up stale files
     _cleanup_stale_files(pid_path, pid)
 
 
 def _cleanup_stale_files(pid_path: Path, pid: int | None) -> None:
-    """Remove socket and PID file after the daemon has exited.
-
-    Only removes the PID file when *pid* matches what is on disk, to
-    avoid accidentally deleting a newer daemon's PID file.
-    """
+    """Remove socket and PID file after the daemon has exited."""
     if sys.platform != "win32":
         sock = daemon_socket_path()
         try:
@@ -358,21 +489,34 @@ def _cleanup_stale_files(pid_path: Path, pid: int | None) -> None:
         except (FileNotFoundError, ValueError):
             pass
     else:
-        # No PID known — cautiously remove if file exists
         try:
             pid_path.unlink(missing_ok=True)
         except Exception:
             pass
 
 
-def _wait_for_daemon(timeout: float = 30.0) -> None:
-    """Wait for the daemon socket/pipe to become available."""
+def _wait_for_daemon(
+    timeout: float = 30.0,
+    proc: subprocess.Popen[bytes] | None = None,
+) -> None:
+    """Wait for the daemon socket/pipe to become available.
+
+    If *proc* is given, polls the process each iteration.  When the process
+    exits before the socket appears, raises ``DaemonStartError`` immediately
+    with the daemon log content — no need to wait for the full timeout.
+    """
     deadline = time.monotonic() + timeout
     sock_path = daemon_socket_path()
     while time.monotonic() < deadline:
+        # Check if the daemon process died before the socket appeared.
+        if proc is not None and proc.poll() is not None:
+            log = _read_daemon_log()
+            msg = "Daemon process exited before it became ready."
+            if log:
+                msg += f"\n\nDaemon log:\n{log}"
+            raise DaemonStartError(msg, log=log)
+
         if sys.platform == "win32":
-            # os.path.exists is unreliable for Windows named pipes;
-            # try an actual connection to verify the daemon is listening.
             try:
                 conn = Client(sock_path, family=_connection_family())
                 conn.close()
@@ -383,15 +527,17 @@ def _wait_for_daemon(timeout: float = 30.0) -> None:
             if os.path.exists(sock_path):
                 return
         time.sleep(0.2)
-    raise TimeoutError("Daemon did not start in time")
+
+    # Timeout — also include log for diagnostics.
+    log = _read_daemon_log()
+    msg = "Daemon did not start in time."
+    if log:
+        msg += f"\n\nDaemon log:\n{log}"
+    raise DaemonStartError(msg, log=log)
 
 
 def _needs_restart(resp: HandshakeResponse) -> bool:
-    """Check if the daemon needs to be restarted.
-
-    Returns True if the version mismatches or if global_settings.yml has been
-    modified since the daemon loaded it.
-    """
+    """Check if the daemon needs to be restarted."""
     if not resp.ok:
         return True
     from .settings import global_settings_mtime_us
@@ -400,44 +546,3 @@ def _needs_restart(resp: HandshakeResponse) -> bool:
     if current_mtime != resp.global_settings_mtime_us:
         return True
     return False
-
-
-def ensure_daemon() -> DaemonClient:
-    """Connect to daemon, starting or restarting as needed.
-
-    1. Try to connect to existing daemon.
-    2. If connection refused: start daemon, retry connect with backoff.
-    3. If connected but version mismatch or global settings changed:
-       stop old daemon, start new one.
-    """
-    # Try connecting to existing daemon
-    try:
-        client = DaemonClient.connect()
-        resp = client.handshake()
-        if not _needs_restart(resp):
-            return client
-        # Version or settings mismatch — restart
-        client.close()
-        stop_daemon()
-    except (ConnectionRefusedError, OSError):
-        pass
-
-    # Start daemon
-    start_daemon()
-    _wait_for_daemon()
-
-    # Connect with retries
-    for _attempt in range(10):
-        try:
-            client = DaemonClient.connect()
-            resp = client.handshake()
-            if not _needs_restart(resp):
-                return client
-            raise RuntimeError(
-                f"Daemon mismatch after fresh start: version={resp.daemon_version}, "
-                f"settings_mtime={resp.global_settings_mtime_us}"
-            )
-        except (ConnectionRefusedError, OSError):
-            time.sleep(0.5)
-
-    raise RuntimeError("Failed to connect to daemon after starting it")

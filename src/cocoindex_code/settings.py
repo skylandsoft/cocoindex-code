@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import cocoindex as _coco
 import yaml as _yaml
 from pathspec import GitIgnoreSpec
 
@@ -45,6 +45,29 @@ DEFAULT_INCLUDED_PATTERNS: list[str] = [
     "**/*.rst",  # reStructuredText
     "**/*.php",  # PHP
     "**/*.lua",  # Lua
+    "**/*.rb",  # Ruby
+    "**/*.swift",  # Swift
+    "**/*.kt",  # Kotlin
+    "**/*.kts",  # Kotlin script
+    "**/*.scala",  # Scala
+    "**/*.r",  # R
+    "**/*.html",  # HTML
+    "**/*.htm",  # HTML
+    "**/*.css",  # CSS
+    "**/*.scss",  # SCSS
+    "**/*.json",  # JSON
+    "**/*.xml",  # XML
+    "**/*.yaml",  # YAML
+    "**/*.yml",  # YAML
+    "**/*.toml",  # TOML
+    "**/*.sol",  # Solidity
+    "**/*.pas",  # Pascal
+    "**/*.dpr",  # Pascal/Delphi
+    "**/*.dtd",  # DTD
+    "**/*.f",  # Fortran
+    "**/*.f90",  # Fortran
+    "**/*.f95",  # Fortran
+    "**/*.f03",  # Fortran
 ]
 
 DEFAULT_EXCLUDED_PATTERNS: list[str] = [
@@ -84,14 +107,18 @@ class LanguageOverride:
 
 
 @dataclass
+class ChunkerMapping:
+    ext: str  # without dot, e.g. "toml"
+    module: str  # "module.path:callable", e.g. "cocoindex_code.toml_chunker:toml_chunker"
+
+
+@dataclass
 class ProjectSettings:
     include_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_INCLUDED_PATTERNS))
     exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
     language_overrides: list[LanguageOverride] = field(default_factory=list)
+    chunkers: list[ChunkerMapping] = field(default_factory=list)
 
-
-# CocoIndex context key for project settings
-PROJECT_SETTINGS = _coco.ContextKey[ProjectSettings]("project_settings")
 
 # ---------------------------------------------------------------------------
 # Default factories
@@ -119,14 +146,103 @@ _SETTINGS_DIR_NAME = ".cocoindex_code"
 _SETTINGS_FILE_NAME = "settings.yml"  # project-level
 _USER_SETTINGS_FILE_NAME = "global_settings.yml"  # user-level
 
+_ENV_DB_PATH_MAPPING = "COCOINDEX_CODE_DB_PATH_MAPPING"
+
+
+@dataclass
+class DbPathMapping:
+    source: Path
+    target: Path
+
+
+_db_path_mapping: list[DbPathMapping] | None = None
+
+
+def _parse_db_path_mapping() -> list[DbPathMapping]:
+    """Parse ``COCOINDEX_CODE_DB_PATH_MAPPING`` env var.
+
+    Format: ``/src1=/dst1,/src2=/dst2``
+    Both source and target must be absolute paths.
+    """
+    raw = os.environ.get(_ENV_DB_PATH_MAPPING, "")
+    if not raw.strip():
+        return []
+
+    mappings: list[DbPathMapping] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("=", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(
+                f"{_ENV_DB_PATH_MAPPING}: invalid entry {entry!r}, expected format 'source=target'"
+            )
+        source = Path(parts[0])
+        target = Path(parts[1])
+        if not source.is_absolute():
+            raise ValueError(
+                f"{_ENV_DB_PATH_MAPPING}: source path must be absolute, got {source!r}"
+            )
+        if not target.is_absolute():
+            raise ValueError(
+                f"{_ENV_DB_PATH_MAPPING}: target path must be absolute, got {target!r}"
+            )
+        mappings.append(DbPathMapping(source=source.resolve(), target=target.resolve()))
+    return mappings
+
+
+def resolve_db_dir(project_root: Path) -> Path:
+    """Return the directory for database files given a project root.
+
+    Applies ``COCOINDEX_CODE_DB_PATH_MAPPING`` if set, otherwise falls back
+    to ``project_root / ".cocoindex_code"``.
+    """
+    global _db_path_mapping  # noqa: PLW0603
+    if _db_path_mapping is None:
+        _db_path_mapping = _parse_db_path_mapping()
+
+    resolved = project_root.resolve()
+    for mapping in _db_path_mapping:
+        if resolved == mapping.source or resolved.is_relative_to(mapping.source):
+            rel = resolved.relative_to(mapping.source)
+            return mapping.target / rel
+    return project_root / _SETTINGS_DIR_NAME
+
+
+def get_db_path_mappings() -> list[DbPathMapping]:
+    """Return the parsed DB path mappings from ``COCOINDEX_CODE_DB_PATH_MAPPING``."""
+    global _db_path_mapping  # noqa: PLW0603
+    if _db_path_mapping is None:
+        _db_path_mapping = _parse_db_path_mapping()
+    return list(_db_path_mapping)
+
+
+def _reset_db_path_mapping_cache() -> None:
+    """Reset the cached mapping (for tests)."""
+    global _db_path_mapping  # noqa: PLW0603
+    _db_path_mapping = None
+
+
+_TARGET_SQLITE_DB_NAME = "target_sqlite.db"
+_COCOINDEX_DB_NAME = "cocoindex.db"
+
+
+def target_sqlite_db_path(project_root: Path) -> Path:
+    """Return the path to the vector index SQLite database for a project."""
+    return resolve_db_dir(project_root) / _TARGET_SQLITE_DB_NAME
+
+
+def cocoindex_db_path(project_root: Path) -> Path:
+    """Return the path to the CocoIndex state database for a project."""
+    return resolve_db_dir(project_root) / _COCOINDEX_DB_NAME
+
 
 def user_settings_dir() -> Path:
     """Return ``~/.cocoindex_code/``.
 
     Respects ``COCOINDEX_CODE_DIR`` env var for overriding the base directory.
     """
-    import os
-
     override = os.environ.get("COCOINDEX_CODE_DIR")
     if override:
         return Path(override)
@@ -166,7 +282,7 @@ def find_legacy_project_root(start: Path) -> Path | None:
     """
     current = start.resolve()
     while True:
-        if (current / _SETTINGS_DIR_NAME / "cocoindex.db").exists():
+        if (current / _SETTINGS_DIR_NAME / _COCOINDEX_DB_NAME).exists():
             return current
         parent = current.parent
         if parent == current:
@@ -244,7 +360,7 @@ def _user_settings_to_dict(settings: UserSettings) -> dict[str, Any]:
 def _user_settings_from_dict(d: dict[str, Any]) -> UserSettings:
     emb_dict = d.get("embedding")
     if not emb_dict or "model" not in emb_dict:
-        raise ValueError("global_settings.yml must contain 'embedding' with at least 'model' field")
+        raise ValueError("Must contain 'embedding' with at least 'model' field")
     # Only pass keys that are present; provider uses dataclass default ("litellm") if omitted
     emb_kwargs: dict[str, Any] = {"model": emb_dict["model"]}
     if "provider" in emb_dict:
@@ -265,6 +381,8 @@ def _project_settings_to_dict(settings: ProjectSettings) -> dict[str, Any]:
         d["language_overrides"] = [
             {"ext": lo.ext, "lang": lo.lang} for lo in settings.language_overrides
         ]
+    if settings.chunkers:
+        d["chunkers"] = [{"ext": cm.ext, "module": cm.module} for cm in settings.chunkers]
     return d
 
 
@@ -272,10 +390,12 @@ def _project_settings_from_dict(d: dict[str, Any]) -> ProjectSettings:
     overrides = [
         LanguageOverride(ext=lo["ext"], lang=lo["lang"]) for lo in d.get("language_overrides", [])
     ]
+    chunkers = [ChunkerMapping(ext=cm["ext"], module=cm["module"]) for cm in d.get("chunkers", [])]
     return ProjectSettings(
         include_patterns=d.get("include_patterns", list(DEFAULT_INCLUDED_PATTERNS)),
         exclude_patterns=d.get("exclude_patterns", list(DEFAULT_EXCLUDED_PATTERNS)),
         language_overrides=overrides,
+        chunkers=chunkers,
     )
 
 
@@ -292,11 +412,14 @@ def load_user_settings() -> UserSettings:
     path = user_settings_path()
     if not path.is_file():
         raise FileNotFoundError(f"User settings not found: {path}")
-    with open(path) as f:
-        data = _yaml.safe_load(f)
-    if not data:
-        raise ValueError(f"User settings file is empty: {path}")
-    return _user_settings_from_dict(data)
+    try:
+        with open(path) as f:
+            data = _yaml.safe_load(f)
+        if not data:
+            raise ValueError("File is empty")
+        return _user_settings_from_dict(data)
+    except Exception as e:
+        raise type(e)(f"Error loading {path}: {e}") from e
 
 
 def save_user_settings(settings: UserSettings) -> Path:
@@ -316,11 +439,14 @@ def load_project_settings(project_root: Path) -> ProjectSettings:
     path = project_settings_path(project_root)
     if not path.is_file():
         raise FileNotFoundError(f"Project settings not found: {path}")
-    with open(path) as f:
-        data = _yaml.safe_load(f)
-    if not data:
-        return default_project_settings()
-    return _project_settings_from_dict(data)
+    try:
+        with open(path) as f:
+            data = _yaml.safe_load(f)
+        if not data:
+            return default_project_settings()
+        return _project_settings_from_dict(data)
+    except Exception as e:
+        raise type(e)(f"Error loading {path}: {e}") from e
 
 
 def save_project_settings(project_root: Path, settings: ProjectSettings) -> Path:
