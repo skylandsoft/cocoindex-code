@@ -46,16 +46,18 @@ A lightweight, effective **(AST-based)** semantic code search tool for your code
 
 Using [pipx](https://pipx.pypa.io/stable/installation/):
 ```bash
-pipx install cocoindex-code       # first install
-pipx upgrade cocoindex-code       # upgrade
+pipx install 'cocoindex-code[full]'          # batteries included (local embeddings)
+pipx upgrade cocoindex-code                  # upgrade
 ```
 
 Using [uv](https://docs.astral.sh/uv/getting-started/installation/):
 ```bash
-uv tool install --upgrade cocoindex-code --prerelease explicit --with "cocoindex>=1.0.0a24"
+uv tool install --upgrade 'cocoindex-code[full]' --prerelease explicit --with "cocoindex>=1.0.0a24"
 ```
 
-The default embedding model runs locally ([sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)) — no API key required, completely free.
+Two install styles — they mirror the Docker image variants of the same names:
+- `cocoindex-code[full]` — batteries-included. Pulls in `sentence-transformers` so local embeddings (no API key required) work out of the box. The `ccc init` interactive prompt defaults to [Snowflake/snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs).
+- `cocoindex-code` (slim) — LiteLLM-only; requires a cloud embedding provider and API key. Use when you don't want the local-embedding deps (~1 GB of torch + transformers).
 
 Next, set up your [coding agent integration](#coding-agent-integration) — or jump to [Manual CLI Usage](#manual-cli-usage) if you prefer direct control.
 
@@ -196,33 +198,98 @@ The recommended approach is a **persistent container**: start it once, and use
 `docker exec` to run CLI commands or connect MCP sessions to it. The daemon
 inside stays warm across sessions, so the embedding model is loaded only once.
 
-### Step 1 — Start the container
+### Choosing an image
+
+Two variants are published from each release:
+
+| Tag | Size | Embedding backends | When to pick |
+|---|---|---|---|
+| `cocoindex/cocoindex-code:latest` (slim, default) | ~450 MB | LiteLLM (cloud: OpenAI, Voyage, Gemini, Ollama, …) | Most users. Cloud-backed embeddings, smaller image, fast pulls. |
+| `cocoindex/cocoindex-code:full` | ~5 GB | sentence-transformers (local) + LiteLLM | When you want local embeddings without an API key, or an offline-ready container. Heavier because of torch + transformers. |
+
+The rest of this section uses `:latest` — substitute `:full` in the `image:` /
+`docker run` commands if you want the full variant.
+
+> **Mac users running the `:full` variant:** local embedding inference is
+> CPU-only inside Docker, because Docker on macOS can't access Apple's Metal
+> (MPS) GPU. If you want local embeddings and fast inference, install
+> natively instead: `pipx install 'cocoindex-code[full]'`. The `:latest`
+> (slim) variant is unaffected — LiteLLM runs the model on the provider's
+> side, so Docker vs. native makes no difference.
+
+### Quick start — `docker compose up -d`
+
+Grab [`docker/docker-compose.yml`](./docker/docker-compose.yml) from this repo and run:
+
+```bash
+# macOS / Windows
+docker compose up -d
+
+# Linux (aligns file ownership on bind-mounted paths with your host user)
+PUID=$(id -u) PGID=$(id -g) docker compose up -d
+```
+
+By default your home directory is mounted into the container (set
+`COCOINDEX_HOST_WORKSPACE` to narrow this to a specific code folder). Index
+data and the embedding model cache persist in a Docker volume across
+restarts. Your global settings file at `$HOME/.cocoindex_code/global_settings.yml`
+is visible and editable on the host; edits take effect on your next `ccc` command.
+
+> **GHCR:** to pull from GitHub Container Registry instead of Docker Hub,
+> change the `image:` line in your copy of `docker-compose.yml` to
+> `ghcr.io/cocoindex-io/cocoindex-code:latest`.
+
+### Or: `docker run`
+
+<details>
+<summary>Docker Desktop (macOS / Windows)</summary>
 
 ```bash
 docker run -d --name cocoindex-code \
-  --volume "$(pwd):/workspace" \
-  --volume cocoindex-db:/db \
-  --volume cocoindex-model-cache:/root/.cache \
-  ghcr.io/cocoindex-io/cocoindex-code:latest
+  --volume "$HOME:/workspace" \
+  --volume cocoindex-data:/var/cocoindex \
+  -e COCOINDEX_CODE_HOST_PATH_MAPPING="/workspace=$HOME" \
+  cocoindex/cocoindex-code:latest
 ```
+</details>
 
-- `/workspace` — mount your project root here
-- `cocoindex-db` — index databases live inside the container (fast native I/O, no cross-OS volume issues)
-- `cocoindex-model-cache` — persists the embedding model across image upgrades
-
-### Step 2 — Index your codebase
+<details>
+<summary>Linux (with <code>PUID</code>/<code>PGID</code>)</summary>
 
 ```bash
-docker exec -it cocoindex-code ccc index
+docker run -d --name cocoindex-code \
+  -e PUID=$(id -u) -e PGID=$(id -g) \
+  --volume "$HOME:/workspace" \
+  --volume cocoindex-data:/var/cocoindex \
+  -e COCOINDEX_CODE_HOST_PATH_MAPPING="/workspace=$HOME" \
+  cocoindex/cocoindex-code:latest
+```
+</details>
+
+### Shell wrapper for `ccc` commands
+
+Paste this into `~/.bashrc` / `~/.zshrc` so `ccc` feels native on the host
+and picks up the right project based on your current directory:
+
+```bash
+ccc() {
+  docker exec -it -e COCOINDEX_CODE_HOST_CWD="$PWD" cocoindex-code ccc "$@"
+}
 ```
 
-### Step 3 — Connect your coding agent
+Now `cd` into any project under your workspace and run `ccc init`, `ccc index`,
+`ccc search ...`, `ccc status`, etc. — it just works.
+
+### Connect your coding agent
 
 <details>
 <summary>Claude Code</summary>
 
+Register MCP from inside the target project so `$PWD` points there:
+
 ```bash
-claude mcp add cocoindex-code -- docker exec -i cocoindex-code ccc mcp
+claude mcp add cocoindex-code -- docker exec -i \
+  -e COCOINDEX_CODE_HOST_CWD="$PWD" cocoindex-code ccc mcp
 ```
 
 Or via `.mcp.json`:
@@ -233,40 +300,50 @@ Or via `.mcp.json`:
     "cocoindex-code": {
       "type": "stdio",
       "command": "docker",
-      "args": ["exec", "-i", "cocoindex-code", "ccc", "mcp"]
+      "args": [
+        "exec",
+        "-i",
+        "-e",
+        "COCOINDEX_CODE_HOST_CWD=${PWD}",
+        "cocoindex-code",
+        "ccc",
+        "mcp"
+      ]
     }
   }
 }
 ```
+
+> Note: use `-i` (not `-it`). The `-t` flag allocates a terminal, which
+> interferes with MCP's JSON messaging over stdin/stdout — only add it for
+> interactive `ccc` commands like `ccc init`.
 </details>
 
 <details>
 <summary>Codex</summary>
 
 ```bash
-codex mcp add cocoindex-code -- docker exec -i cocoindex-code ccc mcp
+codex mcp add cocoindex-code -- docker exec -i \
+  -e COCOINDEX_CODE_HOST_CWD="$PWD" cocoindex-code ccc mcp
 ```
 </details>
 
-### CLI usage inside the container
+### Upgrading from an older image
 
-All `ccc` commands work via `docker exec`:
-
-```bash
-docker exec -it cocoindex-code ccc index
-docker exec -it cocoindex-code ccc search "authentication logic"
-docker exec -it cocoindex-code ccc status
-```
-
-Or set an alias on your host so it feels native:
+Earlier images used separate `cocoindex-db` and `cocoindex-model-cache`
+volumes; the current image consolidates them into a single `cocoindex-data`
+volume. Before pulling the new image, drop the old container and volumes —
+indexes rebuild on your next `ccc index`, and the embedding model is
+re-populated automatically on first start:
 
 ```bash
-alias ccc='docker exec -it cocoindex-code ccc'
+docker rm -f cocoindex-code
+docker volume rm cocoindex-db cocoindex-model-cache
 ```
 
 ### Configuration via environment variables
 
-Pass configuration to `docker run` with `-e`:
+Pass configuration to `docker run` / compose with `-e`:
 
 ```bash
 # Extra extensions (e.g. Typesafe Config, SBT build files)
@@ -275,10 +352,13 @@ Pass configuration to `docker run` with `-e`:
 # Exclude build artefacts (Scala/SBT example)
 -e COCOINDEX_CODE_EXCLUDE_PATTERNS='["**/target/**","**/.bloop/**","**/.metals/**"]'
 
-# Swap in a code-optimised embedding model
--e COCOINDEX_CODE_EMBEDDING_MODEL=voyage/voyage-code-3
+# Set an API key
 -e VOYAGE_API_KEY=your-key
 ```
+
+> **Security note:** mounting `$HOME` gives the container read/write access
+> to everything under it. If that's too broad, bind-mount a narrower
+> directory instead (`COCOINDEX_HOST_WORKSPACE=/path/to/code`).
 
 ### Build the image locally
 
@@ -291,7 +371,7 @@ docker build -t cocoindex-code:local -f docker/Dockerfile .
 - **Ultra Performant**: ⚡ Built on top of ultra performant [Rust indexing engine](https://github.com/cocoindex-io/cocoindex). Only re-indexes changed files for fast updates.
 - **Multi-Language Support**: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, C#, SQL, Shell, and more.
 - **Embedded**: Portable and just works, no database setup required!
-- **Flexible Embeddings**: Local SentenceTransformers by default (free!) or 100+ cloud providers via LiteLLM.
+- **Flexible Embeddings**: Local SentenceTransformers via the `[full]` extra (free, no API key!) or 100+ cloud providers via LiteLLM.
 
 ## Configuration
 
@@ -304,14 +384,17 @@ Shared across all projects. Controls the embedding model and environment variabl
 ```yaml
 embedding:
   provider: sentence-transformers                    # or "litellm"
-  model: sentence-transformers/all-MiniLM-L6-v2
+  model: Snowflake/snowflake-arctic-embed-xs
   device: mps                                        # optional: cpu, cuda, mps (auto-detected if omitted)
+  min_interval_ms: 300                               # optional: pace LiteLLM embedding requests to reduce 429s; defaults to 5 for LiteLLM
 
 envs:                                                # extra environment variables for the daemon
   OPENAI_API_KEY: your-key                           # only needed if not already in your shell environment
 ```
 
 > **Note:** The daemon inherits your shell environment. If an API key (e.g. `OPENAI_API_KEY`) is already set as an environment variable, you don't need to duplicate it in `envs`. The `envs` field is only for values that aren't in your environment.
+
+> **Custom location:** set `COCOINDEX_CODE_DIR` to place `global_settings.yml` somewhere other than `~/.cocoindex_code/` — useful if you want the file to live alongside your projects (e.g. on a synced folder).
 
 ### Project Settings (`<project>/.cocoindex_code/settings.yml`)
 
@@ -375,7 +458,7 @@ See [`src/cocoindex_code/chunking.py`](./src/cocoindex_code/chunking.py) for the
 
 ## Embedding Models
 
-By default, a local SentenceTransformers model ([sentence-transformers/all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)) is used — no API key required. To use a different model, edit `~/.cocoindex_code/global_settings.yml`.
+With the `[full]` extra installed, `ccc init` defaults to a local SentenceTransformers model ([Snowflake/snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs)) — no API key required. To use a different model, edit `~/.cocoindex_code/global_settings.yml`.
 
 > The `envs` entries below are only needed if the key isn't already in your shell environment — the daemon inherits your environment automatically.
 
@@ -397,6 +480,7 @@ Set `OLLAMA_API_BASE` in `envs:` if your Ollama server is not at `http://localho
 ```yaml
 embedding:
   model: text-embedding-3-small
+  min_interval_ms: 300                               # optional: override the 5ms LiteLLM default
 envs:
   OPENAI_API_KEY: your-api-key
 ```
