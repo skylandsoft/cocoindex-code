@@ -78,6 +78,12 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     "**/build/assets",  # Build assets directories
     "**/dist",  # Distribution directories
     "**/Pods",  # Cocoapods dependencies
+    "**/DerivedData",  # Xcode build output
+    "**/venv",  # Python virtual environments
+    "**/env",  # Python virtual environments (alternative name)
+    "**/bower_components",  # Legacy JS dependencies
+    "**/out",  # Java/Gradle/tsc output
+    "**/obj",  # .NET build intermediates
     "**/vendor/*.*/*",  # Go vendor directory (domain-based paths)
     "**/vendor/*",  # PHP vendor directory
     "**/.cocoindex_code",  # Our own index directory
