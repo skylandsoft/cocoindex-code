@@ -62,6 +62,7 @@ from .settings import (
     load_project_settings,
     load_user_settings,
     target_sqlite_db_path,
+    target_sqlite_db_path_for_project_id,
     user_settings_path,
 )
 from .shared import Embedder, check_embedding, create_embedder
@@ -94,7 +95,7 @@ def _resolve_chunker_registry(mappings: list[ChunkerMapping]) -> dict[str, _Chun
 
 
 class ProjectRegistry:
-    """Cache of loaded projects, keyed by project root path.
+    """Cache of loaded projects, keyed by project_id (when set) or project_root.
 
     ``_embedder`` is ``None`` when the daemon is running in "no-settings mode"
     (started before ``global_settings.yml`` existed). In that state
@@ -110,25 +111,48 @@ class ProjectRegistry:
         self._projects = {}
         self._embedder = embedder
 
-    async def get_project(self, project_root: str) -> Project:
-        """Get or create a Project for the given root. Lazy initialization."""
+    @staticmethod
+    def _key(project_root: str, project_id: str | None) -> str:
+        return project_id if project_id is not None else project_root
+
+    async def get_project(self, project_root: str, project_id: str | None = None) -> Project:
+        """Get or create a Project. Lazy initialization.
+
+        When *project_id* is set, the registry caches by that ID so different
+        paths sharing the same ID reuse one index. If an existing entry's
+        project_root has changed (sandbox replaced), the old project is closed
+        after its index lock is released and a new one is created.
+        """
         if self._embedder is None:
             raise RuntimeError(
                 "Daemon has no global settings loaded. Run `ccc init` to set up cocoindex-code."
             )
-        if project_root not in self._projects:
-            root = Path(project_root)
-            project_settings = load_project_settings(root)
-            chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
-            project = await Project.create(root, self._embedder, chunker_registry=chunker_registry)
-            self._projects[project_root] = project
-        return self._projects[project_root]
+        key = self._key(project_root, project_id)
+        if key in self._projects:
+            existing = self._projects[key]
+            if project_id is not None and str(existing._project_root) != project_root:
+                async with existing._index_lock:
+                    pass
+                existing.close()
+                del self._projects[key]
+            else:
+                return existing
 
-    def remove_project(self, project_root: str) -> bool:
+        root = Path(project_root)
+        project_settings = load_project_settings(root)
+        chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
+        project = await Project.create(
+            root, self._embedder, chunker_registry=chunker_registry, project_id=project_id,
+        )
+        self._projects[key] = project
+        return project
+
+    def remove_project(self, project_root: str, project_id: str | None = None) -> bool:
         """Remove a project from the registry. Returns True if it was loaded."""
         import gc
 
-        project = self._projects.pop(project_root, None)
+        key = self._key(project_root, project_id)
+        project = self._projects.pop(key, None)
         if project is not None:
             project.close()
             del project
@@ -149,10 +173,11 @@ class ProjectRegistry:
         """List all loaded projects with their indexing state."""
         return [
             DaemonProjectInfo(
-                project_root=root,
+                project_root=str(project._project_root),
                 indexing=project._index_lock.locked(),
+                project_id=project._project_id,
             )
-            for root, project in self._projects.items()
+            for project in self._projects.values()
         ]
 
 
@@ -265,7 +290,7 @@ async def _handle_doctor(
     else:
         # Project-scope checks
         yield DoctorResponse(result=await _check_file_walk(req.project_root))
-        yield DoctorResponse(result=await _check_index_status(req.project_root))
+        yield DoctorResponse(result=await _check_index_status(req.project_root, req.project_id))
 
     # Final marker
     yield DoctorResponse(
@@ -359,12 +384,17 @@ async def _check_file_walk(project_root_str: str) -> DoctorCheckResult:
     return DoctorCheckResult(name="File Walk", ok=True, details=details, errors=[])
 
 
-async def _check_index_status(project_root_str: str) -> DoctorCheckResult:
+async def _check_index_status(
+    project_root_str: str, project_id: str | None = None,
+) -> DoctorCheckResult:
     """Check index status by querying target_sqlite.db directly."""
     from cocoindex.connectors import sqlite as coco_sqlite
 
-    project_root = Path(project_root_str)
-    db_path = target_sqlite_db_path(project_root)
+    if project_id is not None:
+        db_path = target_sqlite_db_path_for_project_id(project_id)
+    else:
+        project_root = Path(project_root_str)
+        db_path = target_sqlite_db_path(project_root)
     details = [f"Index: {format_path_for_display(db_path)}"]
 
     if not db_path.exists():
@@ -415,11 +445,11 @@ async def _dispatch(
     """
     try:
         if isinstance(req, IndexRequest):
-            project = await registry.get_project(req.project_root)
+            project = await registry.get_project(req.project_root, req.project_id)
             return project.stream_index()
 
         if isinstance(req, SearchRequest):
-            project = await registry.get_project(req.project_root)
+            project = await registry.get_project(req.project_root, req.project_id)
             await project.ensure_indexing_started()
 
             if project.should_wait_for_indexing:
@@ -440,7 +470,7 @@ async def _dispatch(
             )
 
         if isinstance(req, ProjectStatusRequest):
-            project = await registry.get_project(req.project_root)
+            project = await registry.get_project(req.project_root, req.project_id)
             await project.ensure_indexing_started()
             return project.get_status()
 
@@ -452,7 +482,7 @@ async def _dispatch(
             )
 
         if isinstance(req, RemoveProjectRequest):
-            registry.remove_project(req.project_root)
+            registry.remove_project(req.project_root, req.project_id)
             return RemoveProjectResponse(ok=True)
 
         if isinstance(req, StopRequest):

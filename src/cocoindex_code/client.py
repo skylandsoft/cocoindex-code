@@ -211,12 +211,13 @@ def index(
     project_root: str,
     on_progress: Callable[[IndexingProgress], None] | None = None,
     on_waiting: Callable[[], None] | None = None,
+    project_id: str | None = None,
 ) -> IndexResponse:
     """Request indexing with streaming progress. Blocks until complete."""
     project_root = normalize_input_path(project_root)
     conn = _connect_and_handshake()
     try:
-        conn.send_bytes(encode_request(IndexRequest(project_root=project_root)))
+        conn.send_bytes(encode_request(IndexRequest(project_root=project_root, project_id=project_id)))
         while True:
             try:
                 data = conn.recv_bytes()
@@ -248,6 +249,7 @@ def search(
     limit: int = 5,
     offset: int = 0,
     on_waiting: Callable[[], None] | None = None,
+    project_id: str | None = None,
 ) -> SearchResponse:
     """Search the codebase.
 
@@ -267,6 +269,7 @@ def search(
                     paths=paths,
                     limit=limit,
                     offset=offset,
+                    project_id=project_id,
                 )
             )
         )
@@ -289,8 +292,8 @@ def search(
         conn.close()
 
 
-def project_status(project_root: str) -> ProjectStatusResponse:
-    return _send(ProjectStatusRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
+def project_status(project_root: str, project_id: str | None = None) -> ProjectStatusResponse:
+    return _send(ProjectStatusRequest(project_root=normalize_input_path(project_root), project_id=project_id))  # type: ignore[return-value]
 
 
 def daemon_status() -> DaemonStatusResponse:
@@ -299,8 +302,8 @@ def daemon_status() -> DaemonStatusResponse:
     return _send(DaemonStatusRequest())  # type: ignore[return-value]
 
 
-def remove_project(project_root: str) -> RemoveProjectResponse:
-    return _send(RemoveProjectRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
+def remove_project(project_root: str, project_id: str | None = None) -> RemoveProjectResponse:
+    return _send(RemoveProjectRequest(project_root=normalize_input_path(project_root), project_id=project_id))  # type: ignore[return-value]
 
 
 def stop() -> StopResponse:
@@ -315,13 +318,14 @@ def daemon_env() -> DaemonEnvResponse:
 def doctor(
     project_root: str | None = None,
     on_result: Callable[[DoctorCheckResult], None] | None = None,
+    project_id: str | None = None,
 ) -> list[DoctorCheckResult]:
     """Run doctor checks via daemon, streaming results to on_result callback."""
     if project_root is not None:
         project_root = normalize_input_path(project_root)
     conn = _connect_and_handshake()
     try:
-        conn.send_bytes(encode_request(DoctorRequest(project_root=project_root)))
+        conn.send_bytes(encode_request(DoctorRequest(project_root=project_root, project_id=project_id)))
         results: list[DoctorCheckResult] = []
         while True:
             try:

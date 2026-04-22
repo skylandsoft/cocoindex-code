@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -236,6 +237,39 @@ def resolve_db_dir(project_root: Path) -> Path:
             rel = resolved.relative_to(mapping.source)
             return mapping.target / rel
     return project_root / _SETTINGS_DIR_NAME
+
+
+_PROJECT_ID_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}")
+
+
+def validate_project_id(project_id: str) -> None:
+    """Validate a project ID string.
+
+    Must be 1–128 characters, starting with an alphanumeric character,
+    followed by alphanumeric, dot, dash, or underscore characters.
+    """
+    if not _PROJECT_ID_RE.fullmatch(project_id):
+        raise ValueError(
+            f"Invalid project_id: {project_id!r} "
+            "(must be 1-128 chars, alphanumeric/dot/dash/underscore, start with alphanumeric)"
+        )
+
+
+def resolve_db_dir_for_project_id(project_id: str) -> Path:
+    """Return the DB directory for a named project ID.
+
+    Path: ``{user_settings_dir()}/projects/{project_id}/``
+    """
+    validate_project_id(project_id)
+    return user_settings_dir() / "projects" / project_id
+
+
+def target_sqlite_db_path_for_project_id(project_id: str) -> Path:
+    return resolve_db_dir_for_project_id(project_id) / _TARGET_SQLITE_DB_NAME
+
+
+def cocoindex_db_path_for_project_id(project_id: str) -> Path:
+    return resolve_db_dir_for_project_id(project_id) / _COCOINDEX_DB_NAME
 
 
 def get_db_path_mappings() -> list[PathMapping]:

@@ -17,6 +17,7 @@ from .settings import (
     DEFAULT_ST_MODEL,
     EmbeddingSettings,
     cocoindex_db_path,
+    cocoindex_db_path_for_project_id,
     default_project_settings,
     find_parent_with_marker,
     find_project_root,
@@ -24,9 +25,11 @@ from .settings import (
     normalize_input_path,
     project_settings_path,
     resolve_db_dir,
+    resolve_db_dir_for_project_id,
     save_initial_user_settings,
     save_project_settings,
     target_sqlite_db_path,
+    target_sqlite_db_path_for_project_id,
     user_settings_path,
 )
 
@@ -173,7 +176,7 @@ def print_search_results(response: SearchResponse) -> None:
         _typer.echo(r.content)
 
 
-def _run_index_with_progress(project_root: str) -> None:
+def _run_index_with_progress(project_root: str, project_id: str | None = None) -> None:
     """Run indexing with streaming progress display. Exits on failure."""
     from rich.console import Console as _Console
     from rich.live import Live as _Live
@@ -200,7 +203,7 @@ def _run_index_with_progress(project_root: str) -> None:
             live.update(_Spinner("dots", last_progress_line))
 
         try:
-            resp = _client.index(project_root, on_progress=_on_progress, on_waiting=_on_waiting)
+            resp = _client.index(project_root, on_progress=_on_progress, on_waiting=_on_waiting, project_id=project_id)
         except RuntimeError as e:
             live.stop()
             # Let DaemonStartError propagate to the decorator for consistent handling.
@@ -225,6 +228,7 @@ def _search_with_wait_spinner(
     paths: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
+    project_id: str | None = None,
 ) -> SearchResponse:
     """Run search, showing a spinner if waiting for load-time indexing."""
     from rich.console import Console as _Console
@@ -251,6 +255,7 @@ def _search_with_wait_spinner(
             limit=limit,
             offset=offset,
             on_waiting=_on_waiting,
+            project_id=project_id,
         )
 
     return resp
@@ -510,14 +515,16 @@ def init(
 
 @app.command()
 @_catch_daemon_start_error
-def index() -> None:
+def index(
+    project_id: str | None = _typer.Option(None, "--project-id", help="Shared index identifier"),
+) -> None:
     """Create/update index for the codebase."""
     from . import client as _client
 
     project_root = str(require_project_root())
     print_project_header(project_root)
-    _run_index_with_progress(project_root)
-    print_index_stats(_client.project_status(project_root))
+    _run_index_with_progress(project_root, project_id=project_id)
+    print_index_stats(_client.project_status(project_root, project_id=project_id))
 
 
 @app.command()
@@ -529,13 +536,14 @@ def search(
     offset: int = _typer.Option(0, "--offset", help="Number of results to skip"),
     limit: int = _typer.Option(10, "--limit", help="Maximum results to return"),
     refresh: bool = _typer.Option(False, "--refresh", help="Refresh index before searching"),
+    project_id: str | None = _typer.Option(None, "--project-id", help="Shared index identifier"),
 ) -> None:
     """Semantic search across the codebase."""
     project_root = str(require_project_root())
     query_str = " ".join(query)
 
     if refresh:
-        _run_index_with_progress(project_root)
+        _run_index_with_progress(project_root, project_id=project_id)
 
     # Default path filter from CWD
     paths: list[str] | None = None
@@ -553,13 +561,16 @@ def search(
         paths=paths,
         limit=limit,
         offset=offset,
+        project_id=project_id,
     )
     print_search_results(resp)
 
 
 @app.command()
 @_catch_daemon_start_error
-def status() -> None:
+def status(
+    project_id: str | None = _typer.Option(None, "--project-id", help="Shared index identifier"),
+) -> None:
     """Show project status."""
     from . import client as _client
 
@@ -568,27 +579,38 @@ def status() -> None:
     print_project_header(project_root)
 
     _typer.echo(f"Settings: {format_path_for_display(project_settings_path(project_root_path))}")
-    db_path = target_sqlite_db_path(project_root_path)
+    if project_id is not None:
+        db_path = target_sqlite_db_path_for_project_id(project_id)
+    else:
+        db_path = target_sqlite_db_path(project_root_path)
     if db_path.exists():
         _typer.echo(f"Index DB: {format_path_for_display(db_path)}")
 
-    print_index_stats(_client.project_status(project_root))
+    print_index_stats(_client.project_status(project_root, project_id=project_id))
 
 
 @app.command()
 def reset(
     all_: bool = _typer.Option(False, "--all", help="Also remove settings and .gitignore entry"),
     force: bool = _typer.Option(False, "-f", "--force", help="Skip confirmation"),
+    project_id: str | None = _typer.Option(None, "--project-id", help="Shared index identifier"),
 ) -> None:
     """Reset project databases and optionally remove settings."""
     project_root = require_project_root()
     cocoindex_dir = project_root / ".cocoindex_code"
-    db_dir = resolve_db_dir(project_root)
 
-    db_files = [
-        cocoindex_db_path(project_root),
-        target_sqlite_db_path(project_root),
-    ]
+    if project_id is not None:
+        db_dir = resolve_db_dir_for_project_id(project_id)
+        db_files = [
+            cocoindex_db_path_for_project_id(project_id),
+            target_sqlite_db_path_for_project_id(project_id),
+        ]
+    else:
+        db_dir = resolve_db_dir(project_root)
+        db_files = [
+            cocoindex_db_path(project_root),
+            target_sqlite_db_path(project_root),
+        ]
     settings_file = project_settings_path(project_root)
 
     # Determine what will be deleted
@@ -617,7 +639,7 @@ def reset(
     try:
         from . import client as _client
 
-        _client.remove_project(str(project_root))
+        _client.remove_project(str(project_root), project_id=project_id)
     except (ConnectionRefusedError, OSError, RuntimeError):
         pass  # Daemon not running — that's fine
 
@@ -684,7 +706,9 @@ def _print_doctor_result(result: DoctorCheckResult) -> None:
 
 @app.command()
 @_catch_daemon_start_error
-def doctor() -> None:
+def doctor(
+    project_id: str | None = _typer.Option(None, "--project-id", help="Shared index identifier"),
+) -> None:
     """Check system health and report issues."""
     from . import client as _client
     from .settings import (
@@ -748,6 +772,7 @@ def doctor() -> None:
             _client.doctor(
                 project_root=None,
                 on_result=_print_doctor_result,
+                project_id=project_id,
             )
         except Exception as e:
             _print_error(f"Model check failed: {e}")
@@ -779,6 +804,7 @@ def doctor() -> None:
             _client.doctor(
                 project_root=str(project_root),
                 on_result=_print_doctor_result,
+                project_id=project_id,
             )
         except Exception as e:
             _print_error(f"Project checks failed: {e}")

@@ -24,12 +24,15 @@ from .protocol import (
 from .query import query_codebase
 from .settings import (
     cocoindex_db_path as _cocoindex_db_path,
+    cocoindex_db_path_for_project_id as _cocoindex_db_path_for_project_id,
 )
 from .settings import (
     resolve_db_dir,
+    resolve_db_dir_for_project_id,
 )
 from .settings import (
     target_sqlite_db_path as _target_sqlite_db_path,
+    target_sqlite_db_path_for_project_id as _target_sqlite_db_path_for_project_id,
 )
 from .shared import (
     CODEBASE_DIR,
@@ -43,6 +46,8 @@ class Project:
     _env: coco.Environment
     _app: coco.App[[], None]
     _project_root: Path
+    _project_id: str | None
+    _target_db_path: Path
     _index_lock: asyncio.Lock
     _initial_index_done: asyncio.Event
     _indexing_stats: IndexingProgress | None = None
@@ -180,7 +185,7 @@ class Project:
         offset: int = 0,
     ) -> list[SearchResult]:
         """Search within this project."""
-        target_db = _target_sqlite_db_path(self._project_root)
+        target_db = self._target_db_path
         results = await query_codebase(
             query=query,
             target_sqlite_db_path=target_db,
@@ -258,6 +263,7 @@ class Project:
         project_root: Path,
         embedder: Embedder,
         chunker_registry: dict[str, ChunkerFn] | None = None,
+        project_id: str | None = None,
     ) -> Project:
         """Create a project with explicit embedder.
 
@@ -271,15 +277,23 @@ class Project:
             chunker_registry: Optional mapping of file suffix (e.g. ``".toml"``)
                 to a ``ChunkerFn``. When a suffix matches, the registered
                 chunker is called instead of the built-in splitter.
+            project_id: Optional stable identifier for cross-path index sharing.
+                When set, DB files are stored under a shared location keyed by
+                this ID instead of inside the project root.
         """
         settings_dir = project_root / ".cocoindex_code"
         settings_dir.mkdir(parents=True, exist_ok=True)
 
-        db_dir = resolve_db_dir(project_root)
-        db_dir.mkdir(parents=True, exist_ok=True)
+        if project_id is not None:
+            db_dir = resolve_db_dir_for_project_id(project_id)
+            cocoindex_db = _cocoindex_db_path_for_project_id(project_id)
+            target_sqlite_db = _target_sqlite_db_path_for_project_id(project_id)
+        else:
+            db_dir = resolve_db_dir(project_root)
+            cocoindex_db = _cocoindex_db_path(project_root)
+            target_sqlite_db = _target_sqlite_db_path(project_root)
 
-        cocoindex_db = _cocoindex_db_path(project_root)
-        target_sqlite_db = _target_sqlite_db_path(project_root)
+        db_dir.mkdir(parents=True, exist_ok=True)
 
         settings = coco.Settings.from_env(cocoindex_db)
 
@@ -302,6 +316,8 @@ class Project:
         result._env = env
         result._app = app
         result._project_root = project_root
+        result._project_id = project_id
+        result._target_db_path = target_sqlite_db
         result._index_lock = asyncio.Lock()
         result._initial_index_done = asyncio.Event()
         return result

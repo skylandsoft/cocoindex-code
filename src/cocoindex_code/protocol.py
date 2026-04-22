@@ -15,6 +15,7 @@ class HandshakeRequest(_msgspec.Struct, tag="handshake"):
 
 class IndexRequest(_msgspec.Struct, tag="index"):
     project_root: str
+    project_id: str | None = None
 
 
 class SearchRequest(_msgspec.Struct, tag="search"):
@@ -24,10 +25,12 @@ class SearchRequest(_msgspec.Struct, tag="search"):
     paths: list[str] | None = None
     limit: int = 5
     offset: int = 0
+    project_id: str | None = None
 
 
 class ProjectStatusRequest(_msgspec.Struct, tag="project_status"):
     project_root: str
+    project_id: str | None = None
 
 
 class DaemonStatusRequest(_msgspec.Struct, tag="daemon_status"):
@@ -36,6 +39,7 @@ class DaemonStatusRequest(_msgspec.Struct, tag="daemon_status"):
 
 class RemoveProjectRequest(_msgspec.Struct, tag="remove_project"):
     project_root: str
+    project_id: str | None = None
 
 
 class StopRequest(_msgspec.Struct, tag="stop"):
@@ -44,6 +48,7 @@ class StopRequest(_msgspec.Struct, tag="stop"):
 
 class DoctorRequest(_msgspec.Struct, tag="doctor"):
     project_root: str | None = None
+    project_id: str | None = None
 
 
 class DaemonEnvRequest(_msgspec.Struct, tag="daemon_env"):
@@ -130,6 +135,7 @@ class ProjectStatusResponse(_msgspec.Struct, tag="project_status"):
 class DaemonProjectInfo(_msgspec.Struct):
     project_root: str
     indexing: bool
+    project_id: str | None = None
 
 
 class DaemonStatusResponse(_msgspec.Struct, tag="daemon_status"):
