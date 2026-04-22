@@ -77,6 +77,7 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
     "**/target",  # Rust/Maven build output
     "**/build/assets",  # Build assets directories
     "**/dist",  # Distribution directories
+    "**/Pods",  # Cocoapods dependencies
     "**/vendor/*.*/*",  # Go vendor directory (domain-based paths)
     "**/vendor/*",  # PHP vendor directory
     "**/.cocoindex_code",  # Our own index directory
