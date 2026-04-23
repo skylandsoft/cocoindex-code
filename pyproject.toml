@@ -23,7 +23,7 @@ classifiers = [
 
 dependencies = [
     "mcp>=1.0.0",
-    "cocoindex[litellm]==1.0.0a43",
+    "cocoindex[litellm]>=1.0.0,<1.1.0",
     "sqlite-vec>=0.1.0",
     "pydantic>=2.0.0",
     "numpy>=1.24.0",
@@ -40,7 +40,7 @@ dependencies = [
 # an API key.
 embeddings-local = [
     "einops>=0.8.2",
-    "cocoindex[sentence-transformers]==1.0.0a43",
+    "cocoindex[sentence-transformers]>=1.0.0,<1.1.0",
 ]
 # `full` is the umbrella "batteries-included" alias. Today it's just
 # `embeddings-local`, but we expect to bundle more optional niceties under
@@ -51,7 +51,7 @@ embeddings-local = [
 # to avoid resolver edge cases with older pip.
 full = [
     "einops>=0.8.2",
-    "cocoindex[sentence-transformers]==1.0.0a43",
+    "cocoindex[sentence-transformers]>=1.0.0,<1.1.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -60,6 +60,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "prek>=0.1.0",
+    "cocoindex[sentence-transformers]>=1.0.0,<1.1.0",
 ]
 
 [project.scripts]
@@ -95,9 +96,6 @@ dev = [
     "types-pyyaml>=6.0.12.20250915",
 ]
 
-[tool.uv]
-prerelease = "explicit"
-
 [tool.ruff]
 line-length = 100
 
@@ -109,6 +107,7 @@ python_version = "3.11"
 strict = true
 ignore_missing_imports = true
 explicit_package_bases = true
+files = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
