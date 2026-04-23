@@ -119,9 +119,9 @@ class ProjectRegistry:
         """Get or create a Project. Lazy initialization.
 
         When *project_id* is set, the registry caches by that ID so different
-        paths sharing the same ID reuse one index. If an existing entry's
-        project_root has changed (sandbox replaced), the old project is closed
-        after its index lock is released and a new one is created.
+        paths sharing the same ID reuse one index. The LMDB environment is
+        bound at creation time and cannot be reopened in the same process,
+        so we always return the cached instance regardless of project_root.
         """
         if self._embedder is None:
             raise RuntimeError(
@@ -129,14 +129,7 @@ class ProjectRegistry:
             )
         key = self._key(project_root, project_id)
         if key in self._projects:
-            existing = self._projects[key]
-            if project_id is not None and str(existing._project_root) != project_root:
-                async with existing._index_lock:
-                    pass
-                existing.close()
-                del self._projects[key]
-            else:
-                return existing
+            return self._projects[key]
 
         root = Path(project_root)
         project_settings = load_project_settings(root)
